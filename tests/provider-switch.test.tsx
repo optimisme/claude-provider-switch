@@ -5,6 +5,7 @@ import type { On } from 'claude-code'
 import {
   apiBase,
   authHeaders,
+  estimateTokens,
   isChatModel,
   parseCapabilities,
   parseModels,
@@ -157,6 +158,9 @@ test('the helpers read and write the OpenAI shapes', async () => {
   expect(parseTokens('128k')).toBe(128000)
   expect(parseTokens('1m')).toBe(1000000)
   expect(parseTokens('lots')).toBeUndefined()
+  // An image counts at a flat cost, not by the length of its base64.
+  const picture = JSON.stringify({ url: `data:image/png;base64,${'A'.repeat(300_000)}` })
+  expect(estimateTokens(picture)).toBe(Math.ceil('{"url":""}'.length / 4) + 1500)
 
   // OpenRouter-style /models entries carry their own capabilities.
   const listed = parseModels(

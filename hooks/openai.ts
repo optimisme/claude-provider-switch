@@ -168,9 +168,21 @@ export function parseTokens(text: string): number | undefined {
   return n > 0 ? n : undefined
 }
 
-/** A rough token count for a request body: about four characters a token. */
+// What one image costs a vision model, which counts pixels, not bytes: a ceiling
+// that covers a full-screen screenshot.
+const IMAGE_TOKENS = 1500
+
+/**
+ * A rough token count for a request body: about four characters a token, and
+ * each inline image at IMAGE_TOKENS rather than by the length of its base64.
+ */
 export function estimateTokens(body: string): number {
-  return Math.ceil(body.length / 4)
+  let images = 0
+  const text = body.replace(/data:[\w.+-]+\/[\w.+-]+;base64,[A-Za-z0-9+/=]+/g, () => {
+    images++
+    return ''
+  })
+  return Math.ceil(text.length / 4) + images * IMAGE_TOKENS
 }
 
 /**
