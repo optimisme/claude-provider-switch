@@ -141,9 +141,10 @@ async function migrateLegacy($: EngineInterface) {
   }
 }
 
-async function showStatus($: EngineInterface) {
+/** The backend that answers, as the button above the prompt shows it. */
+async function statusText($: EngineInterface) {
   const sel = await read($, selection)
-  if (sel.provider !== 'proxy') return $.ui.status('⇄ Claude')
+  if (sel.provider !== 'proxy') return '⇄ Claude'
 
   const name = (await read($, providers)).find(p => p.id === sel.providerId)?.name ?? sel.providerId
   const key = modelKey(sel.providerId, sel.model)
@@ -153,14 +154,13 @@ async function showStatus($: EngineInterface) {
     info.contextWindow && used && used.model === key
       ? ` · ${Math.round((used.inputTokens / info.contextWindow) * 100)}% ctx`
       : ''
-  $.ui.status(`⇄ ${sel.model} (${name})${share}`)
+  return `⇄ ${sel.model} (${name})${share}`
 }
 
 async function choose($: EngineInterface, value: string) {
   const next = parseChoice(value)
   await update($, selection, () => next)
   await $.store.set(STORE_SELECTION, next)
-  await showStatus($)
   if (next.provider === 'claude') return $.ui.toast('Model requests now go to Claude')
   const name = (await read($, providers)).find(p => p.id === next.providerId)?.name ?? next.providerId
   $.ui.toast(`Model requests now go to ${next.model} via ${name}`)
@@ -169,7 +169,6 @@ async function choose($: EngineInterface, value: string) {
 /** Record how full the context is and warn once when it nears the window. */
 async function noteContext($: EngineInterface, key: string, inputTokens: number, window: number | undefined) {
   await update($, context, () => ({ model: key, inputTokens }))
-  await showStatus($)
 
   if (!window) return
   if (inputTokens < window * CONTEXT_WARN) {
@@ -225,7 +224,6 @@ async function reloadAll($: EngineInterface) {
   await update($, catalogs, all => Object.fromEntries(Object.entries(all).filter(([id]) => list.some(p => p.id === id))))
   await Promise.all(list.map(p => reloadProvider($, p)))
   await checkSelection($)
-  await showStatus($)
 }
 
 /** Back to Claude when the selected provider was removed or no longer lists the model. */
@@ -289,7 +287,6 @@ async function setOverride($: EngineInterface, key: string, patch: Override) {
   const next = Object.keys(cleaned).length ? { ...rest, [key]: cleaned } : rest
   await $.store.set(STORE_OVERRIDES, next)
   await update($, overrides, () => next)
-  await showStatus($)
 }
 
 async function setVision($: EngineInterface, key: string, value: string) {
@@ -343,7 +340,8 @@ export const register: Register = (on, options) => {
     const stored = ((await $.store.get(STORE_OVERRIDES)) as Record<string, Override> | undefined) ?? {}
     await update($, overrides, () => stored)
     await syncProviders($)
-    await showStatus($)
+    // The backend now shows as a button above the prompt; clear the line an older version set.
+    $.ui.status(undefined)
     // The model lists are refreshed at every start; a failed fetch shows in the pane,
     // and one cut short by the session ending has no one left to tell.
     reloadAll($).catch(() => {})
@@ -498,6 +496,22 @@ export const register: Register = (on, options) => {
       stopReason: reply.stopReason,
       usage: cost,
     }
+  })
+
+  on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
+    if (e.props.hasSurvey) return next(e)
+
+    const { Box, Button } = $.ui.resolve(e)
+    const text = await statusText($)
+    return (
+      <Box>
+        <Button
+          key="open-pane"
+          label={text}
+          onPress={() => void $.ui.open({ id: PANE, title: 'Model provider', focus: true })}
+        />
+      </Box>
+    )
   })
 
   on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {

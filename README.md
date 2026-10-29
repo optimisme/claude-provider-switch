@@ -26,10 +26,11 @@ DeepSeek, OpenAI, OpenRouter, Groq, Mistral, a local Ollama or vLLM, and so on.
   for the selected model; your setting wins over what the provider says.
   - A model without vision gets each image replaced by a short note.
   - A model without tools gets no tools and can only answer in text.
-  - After each answer the pane and status line show how full the context is;
+  - After each answer the pane and the button show how full the context is;
     at 80% a toast suggests `/compact` or switching to Claude. A conversation
     already larger than the window is stopped before it is sent.
-- **Status line**: `⇄ Claude` or `⇄ <model> (<provider>) · <n>% ctx`.
+- **Button above the prompt**: `⇄ Claude` or `⇄ <model> (<provider>) · <n>% ctx`;
+  press it to open the pane.
 - **`/provider`**: opens the pane. `/provider <model>` selects the first
   provider's model of that name, `/provider <provider>/<model>` a given
   provider's (`/provider openrouter/openai/gpt-4o`), `/provider claude` goes

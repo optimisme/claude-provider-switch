@@ -101,11 +101,12 @@ const reply = (content: string, promptTokens = 10) => ({
  */
 function world(
   on: On,
-  { routes, history = HISTORY, tools = ['Read'], toasts }: {
+  { routes, history = HISTORY, tools = ['Read'], toasts, opened }: {
     routes: Record<string, Answer | ((r: Request) => Answer)>
     history?: Message[]
     tools?: string[]
     toasts?: string[]
+    opened?: unknown[]
   },
   store?: Record<string, unknown>,
 ): Request[] {
@@ -118,7 +119,10 @@ function world(
     return { value: undefined }
   })
   on('command.register', () => ({ value: { command: 'provider' } }))
-  on('ui.open', () => ({ value: { isPlaced: true } }))
+  on('ui.open', (_, e) => {
+    opened?.push(e)
+    return { value: { isPlaced: true } }
+  })
   on('session.start', (_, e) => ({ cwd: e.cwd }))
   on('prompt.compose', () => ({ sections: [{ id: 'intro', text: 'You are Claude Code.', scope: 'shared' }] }))
   on('tool.list', () => ({ value: tools.map(name => ({ name, description: `The ${name} tool`, mcp: false })) }))
@@ -437,4 +441,26 @@ test('a URL and key from before named providers become a provider named Proxy', 
   expect(requests.find(r => r.url.endsWith('/chat/completions'))?.auth).toBe('Bearer sk-old')
   const listing = (await $.command.run(provider('reload'))).text
   expect(listing).toBe('Proxy (proxy): m')
+})
+
+test('the button above the prompt names the backend and opens the pane', { options: OPTIONS }, async ($, on) => {
+  const opened: unknown[] = []
+  world(on, { routes: { 'https://proxy.test/v1/models': { json: { data: [{ id: 'deepseek-chat' }] } } }, opened })
+  await start($)
+
+  const band = await $.ui.mount({
+    plugin: 'provider-switch',
+    component: 'AbovePrompt',
+    surface: 'desktop',
+    props: { hasSurvey: false, isWorking: false, maxRows: 10, bodyColumns: 60, scroll: { offset: 0, bodyRows: 10 }, view: {} },
+  } as never)
+  expect((await band.find({ key: 'open-pane' }))?.props.label).toBe('⇄ Claude')
+
+  opened.length = 0
+  await band.press({ key: 'open-pane' })
+  expect(opened).toEqual([expect.objectContaining({ id: 'provider-switch', focus: true })])
+
+  await $.command.run({ command: 'provider', args: 'config/deepseek-chat' } as never)
+  expect((await band.find({ key: 'open-pane' }))?.props.label).toBe('⇄ deepseek-chat (Configured)')
+  await band.unmount()
 })
