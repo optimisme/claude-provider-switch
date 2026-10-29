@@ -468,6 +468,8 @@ test('the button above the prompt names the backend and opens the pane', { optio
   const opened: unknown[] = []
   world(on, { routes: { 'https://proxy.test/v1/models': { json: { data: [{ id: 'deepseek-chat' }] } } }, opened })
   await start($)
+  // The pane waits to be asked for.
+  expect(opened).toEqual([])
 
   const band = await $.ui.mount({
     plugin: 'provider-switch',

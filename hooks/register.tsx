@@ -570,8 +570,8 @@ export const register: Register = (on, options) => {
     $.ui.status(undefined)
     // The model lists are refreshed at every start; a failed fetch shows in the pane,
     // and one cut short by the session ending has no one left to tell.
+    // The pane opens only when asked for: the ⚙ above the prompt or the command.
     reloadAll($).catch(() => {})
-    void $.ui.open({ id: PANE, title: 'Provider Switch' })
 
     return next(e)
   })
