@@ -16,7 +16,6 @@ import {
   wantsReasoning,
 } from './openai'
 import type { AnthropicMessage, OpenAiTool } from './openai'
-import { anthropicBase, isCountTokensReply, launcherPath, launcherScript } from './native'
 import { KNOWN_SCHEMAS } from './schemas'
 
 const PANE = 'provider-switch'
@@ -388,53 +387,8 @@ async function reloadProvider($: EngineInterface, p: Provider) {
   const capabilities: Catalog['capabilities'] = { ...listed.capabilities }
   for (const [id, info] of Object.entries(detailed)) capabilities[id] = { ...capabilities[id], ...info }
   const models = listed.ids.filter(id => isChatModel(id, capabilities[id]))
-  const anthropic = models[0] !== undefined && (await servesMessages($, base, p.key, models[0]))
   const loadedAt = await $.clock.now()
-  await update($, catalogs, all => ({ ...all, [p.id]: { models, capabilities, isLoading: false, loadedAt, anthropic } }))
-}
-
-/** Whether the provider also serves the Anthropic Messages API (IETI Agents Proxy does), by its token counter. */
-async function servesMessages($: EngineInterface, base: string, key: string, model: string): Promise<boolean> {
-  if (!anthropicBase(base)) return false
-  try {
-    const res = await $.http.fetch(`${base}/messages/count_tokens`, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json', ...authHeaders(key) },
-      body: JSON.stringify({ model, messages: [{ role: 'user', content: 'hi' }] }),
-    })
-    return isCountTokensReply(res.status, res.text)
-  } catch {
-    return false
-  }
-}
-
-/**
- * Writes the launcher of a native Claude Code session on the selected model (see native.ts)
- * and, on macOS, opens it in a new Terminal window. Answers what happened, in one line.
- */
-async function launchNative($: EngineInterface): Promise<string> {
-  const sel = await read($, selection)
-  if (sel.provider !== 'proxy') return 'Select a provider model first: a native session runs one of its models.'
-  const p = (await loadProviders($)).find(x => x.id === sel.providerId)
-  const cat = (await read($, catalogs))[sel.providerId]
-  const baseUrl = p ? anthropicBase(apiBase(p.url)) : undefined
-  if (!p || !baseUrl || !cat?.anthropic) {
-    return `${p?.name ?? sel.providerId} serves no Anthropic Messages API, so its models only answer through this session.`
-  }
-  const home = await $.env.get('HOME')
-  if (!home) return 'HOME is not set, so there is nowhere to write the launcher.'
-  const info = effectiveInfo(cat, (await read($, overrides))[modelKey(p.id, sel.model)], sel.model)
-  const path = launcherPath(home, p.id)
-  const script = launcherScript({ providerName: p.name, baseUrl, key: p.key, model: sel.model, contextWindow: info.contextWindow, cwd: await $.session.cwd() })
-  await $.fs.write(path, script)
-  // The script holds the key: owner only, and executable so Terminal runs it.
-  await $.process.run(['chmod', '700', path]).catch(() => undefined)
-  const system = await $.process.run(['uname', '-s']).catch(() => undefined)
-  if (system?.stdout.trim() === 'Darwin') {
-    const opened = await $.process.run(['open', '-a', 'Terminal', path]).catch(() => undefined)
-    if (opened?.exitCode === 0) return `Opened ${sel.model} via ${p.name} in a new Terminal window, as a native Claude Code session.`
-  }
-  return `Start ${sel.model} via ${p.name} as a native Claude Code session in a terminal: sh ${path}`
+  await update($, catalogs, all => ({ ...all, [p.id]: { models, capabilities, isLoading: false, loadedAt } }))
 }
 
 /** Reload every provider, drop catalogs of removed ones, and leave a model that is gone. */
@@ -691,8 +645,6 @@ export const register: Register = (on, options) => {
       return { text: 'Model requests now go to Claude.' }
     }
 
-    if (arg === 'launch') return { text: await launchNative($) }
-
     // `reload`, or a model the lists may not hold yet: refresh them first.
     let choice = findModel(arg, await read($, providers), await read($, catalogs))
     if (arg === 'reload' || !choice) {
@@ -944,16 +896,6 @@ export const register: Register = (on, options) => {
       <Box flexDirection="column">
         <Text bold>{sel.provider === 'proxy' ? `Using ${sel.model} via ${selName}` : 'Using Claude'}</Text>
         {sel.provider === 'proxy' && <Text dimColor>{describe(info)}</Text>}
-        {sel.provider === 'proxy' && all[sel.providerId]?.anthropic && (
-          <Box flexDirection="column" marginTop="xs" rowGap="xs">
-            <Text dimColor>
-              {selName} also serves the Anthropic API. A native Claude Code session on {sel.model} streams, keeps its thinking and offers every tool, MCP included.
-            </Text>
-            <Box flexDirection="row">
-              <Button key="native" label="Open native session" onPress={() => void launchNative($).then(text => $.ui.toast(text))} />
-            </Box>
-          </Box>
-        )}
         {usedLine && (
           <Text color={isNearFull ? 'warning' : undefined} dimColor={!isNearFull}>
             {isNearFull ? `⚠ ${usedLine}` : usedLine}

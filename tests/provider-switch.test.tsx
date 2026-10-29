@@ -13,7 +13,6 @@ import {
   parseTokens,
   toOpenAiMessages,
 } from '../hooks/openai'
-import { anthropicBase, isCountTokensReply, launcherPath, launcherScript } from '../hooks/native'
 
 // The provider set in the plugin's options; a bare host, so `/v1` is added.
 const OPTIONS = { proxyUrl: 'https://proxy.test', apiKey: 'ieti_sk_test' }
@@ -103,14 +102,8 @@ const reply = (content: string, promptTokens = 10) => ({
  */
 function world(
   on: On,
-  { routes, history = HISTORY, tools = ['Read'], sections = ['intro'], toasts, opened, hasCurl = true, runs, writes, system = 'Darwin' }: {
+  { routes, history = HISTORY, tools = ['Read'], sections = ['intro'], toasts, opened, hasCurl = true }: {
     routes: Record<string, Answer | ((r: Request) => Answer)>
-    /** Commands other than curl, as run. */
-    runs?: string[][]
-    /** Files written with `$.fs.write`. */
-    writes?: { path: string; text: string }[]
-    /** What `uname -s` prints. */
-    system?: string
     /** False: curl cannot be started on this machine. */
     hasCurl?: boolean
     history?: Message[]
@@ -153,23 +146,12 @@ function world(
   })
   // curl as the chat request runs it: headers in `--header`, the body on stdin, the status last.
   on('process.run', (_, e) => {
-    if (e.argv[0] !== 'curl') {
-      runs?.push([...e.argv])
-      const stdout = e.argv[0] === 'uname' ? `${system}\n` : ''
-      return { value: { exitCode: 0, stdout, stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
-    }
     if (!hasCurl) return { deny: 'spawn curl ENOENT' }
     const header = (name: string) =>
       e.argv.find((a, i) => e.argv[i - 1] === '--header' && a.startsWith(`${name}: `))?.slice(name.length + 2)
     const { status, text } = answer({ url: e.argv.at(-1)!, body: e.init?.stdin, auth: header('authorization'), via: 'curl' })
     return { value: { exitCode: 0, stdout: `${text}\n${status}`, stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
   })
-  on('fs.write', (_, e) => {
-    writes?.push({ path: e.path, text: e.text })
-    return { value: undefined }
-  })
-  on('env.get', (_, e) => ({ value: e.name === 'HOME' ? '/home/ada' : undefined }))
-  on('session.cwd', () => ({ value: '/work/my project' }))
   return requests
 }
 
@@ -788,93 +770,4 @@ test('without curl the chat request falls back to $.http.fetch', { options: OPTI
   await $.command.run(provider('qwen'))
   expect((await drain($.turn.step(step()))).result.answer).toBe('Hi.')
   expect(requests.filter(r => r.url.endsWith('/chat/completions')).map(r => r.via)).toEqual(['fetch'])
-})
-
-test('the native launcher helpers', async () => {
-  expect(anthropicBase('https://agents.ieti.site/v1')).toBe('https://agents.ieti.site')
-  expect(anthropicBase('https://generativelanguage.googleapis.com/v1beta/openai')).toBeUndefined()
-  expect(isCountTokensReply(200, '{"input_tokens":12}')).toBe(true)
-  expect(isCountTokensReply(200, '{"error":{}}')).toBe(false)
-  expect(isCountTokensReply(404, 'Not found')).toBe(false)
-  expect(launcherPath('/home/ada/', 'ieti')).toBe('/home/ada/.claude/provider-switch/launch-ieti.sh')
-
-  const script = launcherScript({ providerName: 'IETI', baseUrl: 'https://agents.ieti.site', key: "k'1", model: 'seer', contextWindow: 90000, cwd: '/work/my project' })
-  expect(script).toContain("export ANTHROPIC_BASE_URL='https://agents.ieti.site'")
-  expect(script).toContain("export ANTHROPIC_AUTH_TOKEN='k'\\''1'")
-  expect(script).toContain('unset ANTHROPIC_API_KEY')
-  for (const name of ['ANTHROPIC_MODEL', 'ANTHROPIC_DEFAULT_OPUS_MODEL', 'ANTHROPIC_DEFAULT_SONNET_MODEL', 'ANTHROPIC_DEFAULT_HAIKU_MODEL', 'CLAUDE_CODE_SUBAGENT_MODEL']) {
-    expect(script).toContain(`export ${name}='seer'`)
-  }
-  expect(script).toContain('export CLAUDE_CODE_MAX_CONTEXT_TOKENS=90000')
-  expect(script).toContain("cd '/work/my project' || exit 1")
-  expect(script.trimEnd().endsWith('exec claude "$@"')).toBe(true)
-  expect(launcherScript({ providerName: 'Local', baseUrl: 'http://localhost:3000', key: '', model: 'm', cwd: '/' })).not.toContain('ANTHROPIC_AUTH_TOKEN')
-})
-
-test('a provider with an Anthropic endpoint opens a native session from the pane', { options: OPTIONS }, async ($, on) => {
-  const runs: string[][] = []
-  const writes: { path: string; text: string }[] = []
-  const toasts: string[] = []
-  const requests = world(on, {
-    routes: {
-      'https://proxy.test/v1/models': { json: { data: [{ id: 'seer' }, { id: 'blind' }] } },
-      'https://proxy.test/v1/model-capabilities': { json: CAPABILITIES },
-      'https://proxy.test/v1/messages/count_tokens': { json: { input_tokens: 9 } },
-    },
-    runs,
-    writes,
-    toasts,
-  })
-  await start($)
-
-  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
-  await ui.press({ key: 'reload' })
-  const probe = requests.find(r => r.url.endsWith('/messages/count_tokens'))
-  expect(probe?.auth).toBe('Bearer ieti_sk_test')
-  expect(JSON.parse(probe?.body ?? '{}').model).toBe('blind')
-  expect(await ui.find({ key: 'native' })).toBeUndefined()
-
-  await $.command.run(provider('seer'))
-  await ui.press({ key: 'native' })
-  await ui.unmount()
-
-  const path = '/home/ada/.claude/provider-switch/launch-config.sh'
-  expect(writes.map(w => w.path)).toEqual([path])
-  expect(writes[0]?.text).toContain("export ANTHROPIC_BASE_URL='https://proxy.test'")
-  expect(writes[0]?.text).toContain("export ANTHROPIC_AUTH_TOKEN='ieti_sk_test'")
-  expect(writes[0]?.text).toContain("export ANTHROPIC_MODEL='seer'")
-  expect(writes[0]?.text).toContain('export CLAUDE_CODE_MAX_CONTEXT_TOKENS=90000')
-  expect(writes[0]?.text).toContain("cd '/work/my project' || exit 1")
-  expect(runs).toEqual([['chmod', '700', path], ['uname', '-s'], ['open', '-a', 'Terminal', path]])
-  expect(toasts.at(-1)).toBe('Opened seer via Configured in a new Terminal window, as a native Claude Code session.')
-})
-
-test('/provider launch outside macOS answers the command, and a provider without the endpoint says so', async ($, on) => {
-  const writes: { path: string; text: string }[] = []
-  world(on, {
-    routes: {
-      'https://ieti.test/v1/models': { json: { data: [{ id: 'seer' }] } },
-      'https://ieti.test/v1/messages/count_tokens': { json: { input_tokens: 9 } },
-      'https://plain.test/v1/models': { json: { data: [{ id: 'gpt' }] } },
-    },
-    writes,
-    system: 'Linux',
-  }, {
-    providers: [
-      { id: 'ieti', name: 'IETI', url: 'https://ieti.test' },
-      { id: 'plain', name: 'Plain', url: 'https://plain.test' },
-    ],
-    keys: { ieti: 'ieti_sk_x' },
-  })
-  await start($)
-  await $.command.run(provider('reload'))
-
-  expect((await $.command.run(provider('launch'))).text).toBe('Select a provider model first: a native session runs one of its models.')
-  await $.command.run(provider('plain/gpt'))
-  expect((await $.command.run(provider('launch'))).text).toBe('Plain serves no Anthropic Messages API, so its models only answer through this session.')
-  await $.command.run(provider('ieti/seer'))
-  expect((await $.command.run(provider('launch'))).text).toBe(
-    'Start seer via IETI as a native Claude Code session in a terminal: sh /home/ada/.claude/provider-switch/launch-ieti.sh',
-  )
-  expect(writes.map(w => w.path)).toEqual(['/home/ada/.claude/provider-switch/launch-ieti.sh'])
 })

@@ -54,18 +54,10 @@ DeepSeek, OpenAI, OpenRouter, Groq, Mistral, a local Ollama or vLLM, and so on.
   injected context are listed once a request has carried them.
 - **Button above the prompt**: `⇄ Claude` or `⇄ <model> (<provider>) · <n>% ctx`;
   press it to open the pane.
-- **Native sessions**: a provider that also serves the Anthropic Messages API
-  (IETI Agents Proxy's `/v1/messages`, found by its
-  `POST /v1/messages/count_tokens`) gets **Open native session** under the
-  selected model. It starts a new Claude Code session whose own client talks
-  to the provider, so replies stream, thinking is kept in the conversation,
-  and every tool is offered with its real schema, MCP and agents included. See
-  [Native sessions](#native-sessions).
 - **`/provider`**: opens the pane. `/provider <model>` selects the first
   provider's model of that name, `/provider <provider>/<model>` a given
   provider's (`/provider openrouter/openai/gpt-4o`), `/provider claude` goes
-  back to Claude, `/provider reload` lists every provider's models, and
-  `/provider launch` starts a native session on the selected model.
+  back to Claude, and `/provider reload` lists every provider's models.
 
 ## Install
 
@@ -126,31 +118,7 @@ turn (the `turn.step` hook) itself instead of sending it to Anthropic:
 
 With Claude selected, requests pass through untouched.
 
-## Native sessions
-
-A mod cannot point a running session at another endpoint: the `turn.step` hook
-may change a request's model and effort, not where it goes or which key it
-carries. So for a provider with an Anthropic endpoint, **Open native session**
-(or `/provider launch`) writes a launcher script and starts a new session:
-
-- The script is `~/.claude/provider-switch/launch-<provider>.sh`, owner-only,
-  rewritten each time with the selected model. It sets `ANTHROPIC_BASE_URL`
-  (the provider's URL without `/v1`), `ANTHROPIC_AUTH_TOKEN` (the provider's
-  key), `ANTHROPIC_MODEL` and the `opus`/`sonnet`/`haiku`/subagent aliases to
-  the model, so no helper call goes to Anthropic, and
-  `CLAUDE_CODE_MAX_CONTEXT_TOKENS` to the model's context window when known.
-  It then runs `claude` in this session's folder.
-- On macOS it opens in a new Terminal window. Elsewhere the pane says the
-  command to run, `sh ~/.claude/provider-switch/launch-<provider>.sh`; extra
-  arguments go to `claude` (`… -p "question"`, `--resume`).
-- The key is in that file in plain text, as in the plugin's own store.
-- The session uses your usual Claude Code settings, plugins and MCP servers.
-  `ANTHROPIC_AUTH_TOKEN` takes the place of your Claude login for its requests.
-
 ## Limitations
-
-These apply to a provider's model answering inside the current session; a
-[native session](#native-sessions) has none of them.
 
 - Replies arrive whole, not streamed. Chat requests go through `curl` (included
   in macOS, Windows 10 and later, and most Linux installs), allowed 5 minutes;
@@ -164,9 +132,6 @@ These apply to a provider's model answering inside the current session; a
   models that expect their reasoning sent back during a tool loop may fail.
 - Models only reachable through OpenAI's Responses API, and Azure OpenAI's URL
   scheme, are not supported.
-- Native sessions start in a new window on macOS only; on Linux and Windows
-  the launcher is a POSIX shell script to run yourself (on Windows, from Git
-  Bash or WSL).
 - Claude Code's other model calls (compaction, titles, helper classifiers) still
   go to Claude.
 - How well tools work depends on the model's function-calling quality.
