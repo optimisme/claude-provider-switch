@@ -37,9 +37,18 @@ DeepSeek, OpenAI, OpenRouter, Groq, Mistral, a local Ollama or vLLM, and so on.
 
 ## Install
 
+**Claude desktop app (Code tab):** click **+** next to the prompt box, then
+**Plugins** → **Add marketplace**, enter `optimisme/claude-provider-switch`,
+then **Add plugin** next to *provider-switch*. Start a new session and type
+`/provider` to open the pane.
+
+**Claude Code in a terminal:**
+
 ```
 /plugin install provider-switch --marketplace optimisme/claude-provider-switch
 ```
+
+Both install it for your user, so the desktop app and the terminal share it.
 
 Or, while developing, start Claude Code with the folder loaded directly:
 
