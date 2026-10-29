@@ -41,6 +41,8 @@ export type Catalog = {
   error?: string
   /** `$.clock.now()` of the last successful reload. */
   loadedAt?: number
+  /** Whether the provider also serves the Anthropic Messages API, so a native Claude Code session can use it. */
+  anthropic?: boolean
 }
 
 /** How full a proxy model's context was at its last answer. */
