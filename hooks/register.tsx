@@ -1,5 +1,5 @@
 import { atom, read, update } from 'claude-code'
-import type { EngineInterface, PluginOptions, Register, RenderElement } from 'claude-code'
+import type { EngineInterface, PluginOptions, PromptComposeInput, Register, RenderElement } from 'claude-code'
 
 import type { Catalog, ContextItem, ContextSeen, ContextUse, Draft, ModelInfo, Override, ProviderView, Selection } from '../types'
 import {
@@ -73,8 +73,14 @@ type Provider = StoredProvider & { key: string; source: ProviderView['source'] }
 
 // The plugin's config values, as `register` last received them.
 let pluginOptions: PluginOptions = {}
-// The system prompt Claude Code composed last; sent to the provider as its system message.
+// The system prompt Claude Code composed last, less what is switched off. No event says whose
+// prompt a composition was, so only a subagent's request is sent with it; the main loop
+// composes its own at each step.
 let systemPrompt = ''
+// How many of the mod's own compositions are under way: those leave `systemPrompt` alone.
+let ownComposes = 0
+// The facts of the engine's last composition, which the main loop's own reuses.
+let lastFacts: PromptComposeInput | undefined
 // The model whose context the mod last warned about, so each crossing warns once.
 let warnedModel = ''
 // A thinking model's `reasoning_content`, by the id of each tool call its reply made: the
@@ -85,8 +91,14 @@ const REASONINGS_KEPT = 500
 // How long a chat request may take. `$.http.fetch` gives up after 30 s and takes no
 // timeout, so chat requests go through curl, which a slow model can take minutes with.
 const CHAT_TIMEOUT_S = 300
-// False once curl could not be started here; chat requests then use `$.http.fetch`.
-let hasCurl = true
+// How chat requests go out: curl under sh, which hands curl the key through its environment
+// (only its owner can read it) rather than its command line (`ps` shows that to everyone);
+// curl alone where there is no sh (Windows, which keeps a command line from other users);
+// else `$.http.fetch` and its 30 s. Each falls to the next once it cannot start here.
+let chatVia: 'sh' | 'curl' | 'fetch' = 'sh'
+const CURL_ENV = 'PROVIDER_SWITCH_CURL_CONFIG'
+// curl reads the key's header as a config file on fd 3, written from CURL_ENV.
+const CURL_SH = `curl --config /dev/fd/3 "$@" 3<<EOF\n$${CURL_ENV}\nEOF\n`
 // Providers whose URL or key changed in their open form: their models reload when it closes.
 const staleIds = new Set<string>()
 // Below this, a context window being typed is taken as not finished yet (`12` on the way to `128k`).
@@ -297,13 +309,15 @@ async function barView($: EngineInterface): Promise<{ name: string; labels: stri
   return { name, labels, isNearFull: isUsed && used!.inputTokens >= window! * CONTEXT_WARN }
 }
 
-async function choose($: EngineInterface, value: string) {
+/** Select `value` and say so; `why`, when given, is said instead. */
+async function choose($: EngineInterface, value: string, why?: string) {
   const next = parseChoice(value)
   await update($, selection, () => next)
   await $.store.set(STORE_SELECTION, next)
   // Each provider has its own context settings: the engine asks again for what it injects.
   $.ui.invalidate('prompt.attachment')
   $.ui.invalidate('prompt.context')
+  if (why) return $.ui.toast(why)
   if (next.provider === 'claude') return $.ui.toast('Model requests now go to Claude')
   const last = ((await $.store.get(STORE_LAST_MODELS)) as Record<string, string> | undefined) ?? {}
   await $.store.set(STORE_LAST_MODELS, { ...last, [next.providerId]: next.model })
@@ -403,13 +417,12 @@ async function reloadAll($: EngineInterface) {
 async function checkSelection($: EngineInterface) {
   const sel = await read($, selection)
   if (sel.provider !== 'proxy') return
-  const isKnown = (await read($, providers)).some(p => p.id === sel.providerId)
+  const known = (await read($, providers)).find(p => p.id === sel.providerId)
   const cat = (await read($, catalogs))[sel.providerId]
   // A failed reload says nothing about the model: keep it.
-  const isGone = !isKnown || (cat !== undefined && !cat.isLoading && !cat.error && !cat.models.includes(sel.model))
+  const isGone = !known || (cat !== undefined && !cat.isLoading && !cat.error && !cat.models.includes(sel.model))
   if (!isGone) return
-  await choose($, CLAUDE)
-  $.ui.toast(`${sel.model} is no longer offered by ${isKnown ? sel.providerId : 'a removed provider'}; switched back to Claude`)
+  await choose($, CLAUDE, `${sel.model} is no longer offered by ${known?.name ?? 'a removed provider'}; switched back to Claude`)
 }
 
 async function setDraft($: EngineInterface, field: keyof Draft, value: string) {
@@ -541,45 +554,73 @@ function catalogText(list: ProviderView[], all: Record<string, Catalog>): string
     .join('\n')
 }
 
+/** The key's header as a curl config line; a quote or backslash escaped, a line break dropped. */
+function curlConfig(key: string): string {
+  return Object.entries(authHeaders(key))
+    .map(([name, value]) => `header = "${`${name}: ${value}`.replace(/[\r\n]/g, '').replace(/["\\]/g, '\\$&')}"`)
+    .join('\n')
+}
+
+/** Runs curl for one chat request the way `chatVia` says; rejects when it cannot start. */
+function runCurl($: EngineInterface, url: string, key: string, body: string) {
+  const args = [
+    '--silent',
+    '--show-error',
+    '--max-time',
+    String(CHAT_TIMEOUT_S),
+    '--request',
+    'POST',
+    '--header',
+    'content-type: application/json',
+    '--data-binary',
+    '@-',
+    '--write-out',
+    '\n%{http_code}',
+  ]
+  const init = { stdin: body, timeoutMs: (CHAT_TIMEOUT_S + 10) * 1000 }
+  if (chatVia === 'sh') return $.process.run(['sh', '-c', CURL_SH, 'sh', ...args, url], { ...init, env: { [CURL_ENV]: curlConfig(key) } })
+  const auth = Object.entries(authHeaders(key)).flatMap(([name, value]) => ['--header', `${name}: ${value}`])
+  return $.process.run(['curl', ...args, ...auth, url], init)
+}
+
 /**
  * POSTs a chat request with curl, allowed CHAT_TIMEOUT_S; the body goes on stdin, as a
- * whole conversation outgrows a command line. Where curl cannot start (a minimal Linux,
- * a Windows before 10), it falls back to `$.http.fetch` and its 30 s for the session.
+ * whole conversation outgrows a command line. Where neither sh nor curl can start (a
+ * minimal Linux, a Windows before 10), it falls back to `$.http.fetch` and its 30 s.
  */
-async function postChat($: EngineInterface, url: string, key: string, body: string) {
-  const headers = { 'content-type': 'application/json', ...authHeaders(key) }
-  if (hasCurl) {
-    const run = await $.process
-      .run(
-        [
-          'curl',
-          '--silent',
-          '--show-error',
-          '--max-time',
-          String(CHAT_TIMEOUT_S),
-          '--request',
-          'POST',
-          ...Object.entries(headers).flatMap(([name, value]) => ['--header', `${name}: ${value}`]),
-          '--data-binary',
-          '@-',
-          '--write-out',
-          '\n%{http_code}',
-          url,
-        ],
-        { stdin: body, timeoutMs: (CHAT_TIMEOUT_S + 10) * 1000 },
-      )
-      .catch(() => undefined)
-    if (run) {
-      // curl's own failures (28 timed out, 6 unknown host, 7 refused) are the request's.
-      if (run.exitCode !== 0) throw new Error(`curl: ${run.stderr.trim() || `exit code ${run.exitCode}`}`)
-      if (run.isStdoutTruncated) throw new Error('the reply was too large to read')
-      const cut = run.stdout.lastIndexOf('\n')
-      const status = Number(run.stdout.slice(cut + 1))
-      return { status, ok: status >= 200 && status < 300, text: run.stdout.slice(0, cut) }
+async function postChat($: EngineInterface, url: string, key: string, body: string): Promise<{ status: number; ok: boolean; text: string }> {
+  if (chatVia !== 'fetch') {
+    const run = await runCurl($, url, key, body).catch(() => undefined)
+    // Under sh, 127 is a curl it could not find.
+    const hasStarted = run !== undefined && !(chatVia === 'sh' && run.exitCode === 127)
+    if (!hasStarted) {
+      chatVia = chatVia === 'sh' && run === undefined ? 'curl' : 'fetch'
+      return postChat($, url, key, body)
     }
-    hasCurl = false
+    // curl's own failures (28 timed out, 6 unknown host, 7 refused) are the request's.
+    if (run.exitCode !== 0) throw new Error(`curl: ${run.stderr.trim() || `exit code ${run.exitCode}`}`)
+    if (run.isStdoutTruncated) throw new Error('the reply was too large to read')
+    const cut = run.stdout.lastIndexOf('\n')
+    const status = Number(run.stdout.slice(cut + 1))
+    return { status, ok: status >= 200 && status < 300, text: run.stdout.slice(0, cut) }
   }
-  return $.http.fetch(url, { method: 'POST', headers, body })
+  return $.http.fetch(url, { method: 'POST', headers: { 'content-type': 'application/json', ...authHeaders(key) }, body })
+}
+
+/**
+ * The main loop's system prompt for `model`, composed now with the session's tools, less
+ * what is switched off; the last one composed until the engine has composed any.
+ */
+async function mainPrompt($: EngineInterface, model: string): Promise<string> {
+  if (!lastFacts) return systemPrompt
+  const tools = (await $.tool.list()).map(t => t.name)
+  const promptModel = lastFacts.model === model ? lastFacts.promptModel : model
+  ownComposes++
+  try {
+    return (await $.prompt.compose({ ...lastFacts, model, promptModel, tools })).sections.map(s => s.text).join('\n\n')
+  } finally {
+    ownComposes--
+  }
 }
 
 export const register: Register = (on, options) => {
@@ -671,7 +712,10 @@ export const register: Register = (on, options) => {
 
     const off = await offNow($)
     const kept = composed.sections.filter(s => !off.includes(`section:${s.id}`))
-    systemPrompt = kept.map(s => s.text).join('\n\n')
+    if (!ownComposes) {
+      systemPrompt = kept.map(s => s.text).join('\n\n')
+      lastFacts = e
+    }
     return { sections: kept }
   })
 
@@ -750,11 +794,13 @@ export const register: Register = (on, options) => {
     const info = effectiveInfo((await read($, catalogs))[provider.id], (await read($, overrides))[key], sel.model)
     // Only a model its provider says lacks tools gets none; unknown means try.
     const tools = info.tools === false ? [] : await offeredTools($, (await read($, contextOff))[provider.id])
+    // A subagent running beside the main loop may have composed last.
+    const system = e.agentId === undefined ? await mainPrompt($, e.model) : systemPrompt
 
     const request = (fillReasoning: boolean) =>
       JSON.stringify({
         model: sel.model,
-        messages: toOpenAiMessages(systemPrompt, history as unknown as AnthropicMessage[], {
+        messages: toOpenAiMessages(system, history as unknown as AnthropicMessage[], {
           images: info.image !== false,
           reasoning: Object.fromEntries(reasonings),
           fillReasoning,

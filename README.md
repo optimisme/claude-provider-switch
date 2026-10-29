@@ -24,7 +24,8 @@ DeepSeek, OpenAI, OpenRouter, Groq, Mistral, a local Ollama or vLLM, and so on.
   Shown in the pane, e.g. `90k context · 8k output · vision · tools · reasoning`.
   Where a provider says nothing, set **Vision** and **Context window** by hand
   for the selected model; your setting wins over what the provider says.
-  - A model without vision gets each image replaced by a short note.
+  - A model without vision gets each image replaced by a short note. Images
+    only reachable at a remote URL are replaced the same way for every model.
   - A model without tools gets no tools and can only answer in text.
   - After each answer the pane and the button show how full the context is;
     at 80% a toast suggests `/compact` or switching to Claude. A conversation
@@ -112,7 +113,9 @@ turn (the `turn.step` hook) itself instead of sending it to Anthropic:
 2. translates them to the chat-completions format (tool uses → `tool_calls`,
    tool results → `tool` messages),
 3. `POST`s them to `<base>/chat/completions` with `curl`, with
-   `Authorization: Bearer <key>` when the provider has a key,
+   `Authorization: Bearer <key>` when the provider has a key. On macOS and
+   Linux curl reads that header from its environment, not its command line,
+   so other users of the machine cannot see the key in `ps`,
 4. turns the reply back into text and tool calls that Claude Code runs as usual
    (with its normal permission prompts).
 
@@ -128,8 +131,9 @@ With Claude selected, requests pass through untouched.
   Grep, WebFetch, WebSearch and Agent. The mod API does not expose built-in tool
   schemas, so they are written out in `hooks/schemas.ts`. MCP and other tools
   are not offered, and any of these can be switched off under **Context**.
-- Thinking blocks, documents and prompt caching are not forwarded. Reasoning
-  models that expect their reasoning sent back during a tool loop may fail.
+- Documents and prompt caching are not forwarded. A thinking model's reasoning
+  is shown live and sent back with the tool calls it made; a tool call from an
+  earlier session or another model is sent back with an empty one.
 - Models only reachable through OpenAI's Responses API, and Azure OpenAI's URL
   scheme, are not supported.
 - Claude Code's other model calls (compaction, titles, helper classifiers) still

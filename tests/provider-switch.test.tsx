@@ -88,7 +88,7 @@ const CAPABILITIES = {
   ],
 }
 
-type Request = { url: string; body?: string; auth?: string; via?: 'fetch' | 'curl' }
+type Request = { url: string; body?: string; auth?: string; via?: 'fetch' | 'curl' | 'sh'; argv?: readonly string[] }
 type Answer = { status?: number; json?: unknown; text?: string }
 
 const reply = (content: string, promptTokens = 10) => ({
@@ -102,10 +102,12 @@ const reply = (content: string, promptTokens = 10) => ({
  */
 function world(
   on: On,
-  { routes, history = HISTORY, tools = ['Read'], sections = ['intro'], toasts, opened, hasCurl = true }: {
+  { routes, history = HISTORY, tools = ['Read'], sections = ['intro'], toasts, opened, hasCurl = true, hasSh = true }: {
     routes: Record<string, Answer | ((r: Request) => Answer)>
     /** False: curl cannot be started on this machine. */
     hasCurl?: boolean
+    /** False: sh cannot be started on this machine (Windows). */
+    hasSh?: boolean
     history?: Message[]
     tools?: string[]
     /** System prompt section ids; `intro` reads `You are Claude Code.`. */
@@ -129,8 +131,11 @@ function world(
     return { value: { isPlaced: true } }
   })
   on('session.start', (_, e) => ({ cwd: e.cwd }))
-  on('prompt.compose', () => ({
-    sections: sections.map(id => ({ id, text: id === 'intro' ? 'You are Claude Code.' : `The ${id} section.`, scope: 'shared' as const })),
+  // A composition for a request offering only Grep is a subagent's.
+  on('prompt.compose', (_, e) => ({
+    sections: e.tools?.length === 1 && e.tools[0] === 'Grep'
+      ? [{ id: 'agent', text: 'You are a subagent.', scope: 'shared' as const }]
+      : sections.map(id => ({ id, text: id === 'intro' ? 'You are Claude Code.' : `The ${id} section.`, scope: 'shared' as const })),
   }))
   on('tool.list', () => ({ value: tools.map(name => ({ name, description: `The ${name} tool`, mcp: false })) }))
   on('session.messages', () => ({ value: history as never }))
@@ -144,12 +149,23 @@ function world(
     const { status, text } = answer({ url: e.url, body: e.init?.body, auth: e.init?.headers?.authorization, via: 'fetch' })
     return { value: { status, ok: status < 300, headers: {}, text } }
   })
-  // curl as the chat request runs it: headers in `--header`, the body on stdin, the status last.
+  // curl as the chat request runs it: the body on stdin, the status last, and the key's header
+  // in the curl config sh hands it from the environment, or in `--header` without sh.
   on('process.run', (_, e) => {
-    if (!hasCurl) return { deny: 'spawn curl ENOENT' }
+    const isSh = e.argv[0] === 'sh'
+    if (!hasCurl || (isSh && !hasSh)) return { deny: `spawn ${e.argv[0]} ENOENT` }
+    const config = e.init?.env?.PROVIDER_SWITCH_CURL_CONFIG
     const header = (name: string) =>
-      e.argv.find((a, i) => e.argv[i - 1] === '--header' && a.startsWith(`${name}: `))?.slice(name.length + 2)
-    const { status, text } = answer({ url: e.argv.at(-1)!, body: e.init?.stdin, auth: header('authorization'), via: 'curl' })
+      isSh
+        ? config?.match(new RegExp(`^header = "${name}: (.*)"$`, 'm'))?.[1]?.replace(/\\(.)/g, '$1')
+        : e.argv.find((a, i) => e.argv[i - 1] === '--header' && a.startsWith(`${name}: `))?.slice(name.length + 2)
+    const { status, text } = answer({
+      url: e.argv.at(-1)!,
+      body: e.init?.stdin,
+      auth: header('authorization'),
+      via: isSh ? 'sh' : 'curl',
+      argv: e.argv,
+    })
     return { value: { exitCode: 0, stdout: `${text}\n${status}`, stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
   })
   return requests
@@ -249,8 +265,10 @@ test('picking a configured model sends the next step to it', { options: OPTIONS 
   const call = requests.find(r => r.url.endsWith('/chat/completions'))
   const sent = JSON.parse(call?.body ?? '{}')
   expect(call?.auth).toBe('Bearer ieti_sk_test')
-  // The chat request goes through curl, which is not held to $.http.fetch's 30 s.
-  expect(call?.via).toBe('curl')
+  // The chat request goes through curl, which is not held to $.http.fetch's 30 s, under sh,
+  // which hands it the key outside its command line, where `ps` would show it.
+  expect(call?.via).toBe('sh')
+  expect(call?.argv?.join(' ')).not.toContain('ieti_sk_test')
   expect(sent.model).toBe('deepseek-chat')
   expect(sent.messages[0]).toEqual({ role: 'system', content: 'You are Claude Code.' })
   // Only tools with a known schema are offered.
@@ -758,6 +776,62 @@ test('a provider not in use offers its models, and picking one switches to it', 
   expect((await ui.find({ key: 'model' }))?.props.value).toBe('proxy:deepseek/deepseek-reasoner')
 })
 
+test('an image only reachable at a remote URL becomes a note', () => {
+  const remote: Message[] = [
+    { role: 'user', content: [{ type: 'image', source: { type: 'url', url: 'https://example.test/cat.png' } }] },
+  ]
+  expect(toOpenAiMessages('', remote)).toEqual([{ role: 'user', content: '[image omitted: only inline images are sent]' }])
+})
+
+test('the main loop gets its own system prompt, a subagent the one composed for it', { options: OPTIONS }, async ($, on) => {
+  const requests = world(on, {
+    routes: {
+      'https://proxy.test/v1/models': { json: { data: [{ id: 'qwen' }] } },
+      'https://proxy.test/v1/chat/completions': reply('Hi.'),
+    },
+  })
+  await start($)
+  await $.command.run(provider('qwen'))
+  // A subagent's request is composed last, while the main loop is still working.
+  await $.prompt.compose({ model: 'claude-opus-5-5', promptModel: 'claude-opus-5-5', surfaces: ['desktop'], tools: ['Grep'], outputStyle: null, traits: [] })
+  await drain($.turn.step(step()))
+  await drain($.turn.step({ ...step(), agentId: 'a1' }))
+  const systems = requests.filter(r => r.url.endsWith('/chat/completions')).map(r => JSON.parse(r.body!).messages[0].content)
+  expect(systems).toEqual(['You are Claude Code.', 'You are a subagent.'])
+})
+
+test('a model its provider stops listing switches back to Claude with one toast', { options: OPTIONS }, async ($, on) => {
+  let isListed = true
+  const toasts: string[] = []
+  world(on, {
+    routes: { 'https://proxy.test/v1/models': () => ({ json: { data: [{ id: isListed ? 'qwen' : 'other' }] } }) },
+    toasts,
+  })
+  await start($)
+  await $.command.run(provider('qwen'))
+  isListed = false
+  toasts.length = 0
+  await $.command.run(provider('reload'))
+  expect(toasts).toEqual(['qwen is no longer offered by Configured; switched back to Claude'])
+})
+
+test('without sh, curl gets the key in its arguments', { options: OPTIONS }, async ($, on) => {
+  const requests = world(on, {
+    routes: {
+      'https://proxy.test/v1/models': { json: { data: [{ id: 'qwen' }] } },
+      'https://proxy.test/v1/chat/completions': reply('Hi.'),
+    },
+    hasSh: false,
+  })
+  await start($)
+  await $.command.run(provider('qwen'))
+  expect((await drain($.turn.step(step()))).result.answer).toBe('Hi.')
+  const call = requests.find(r => r.url.endsWith('/chat/completions'))
+  expect(call?.via).toBe('curl')
+  expect(call?.auth).toBe('Bearer ieti_sk_test')
+})
+
+// Last: curl, once it cannot start, is not tried again in this process.
 test('without curl the chat request falls back to $.http.fetch', { options: OPTIONS }, async ($, on) => {
   const requests = world(on, {
     routes: {

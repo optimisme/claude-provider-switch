@@ -77,10 +77,13 @@ function textOf(value: unknown): string {
     .join('\n')
 }
 
+/**
+ * An image as an inline `data:` URL; undefined for one only reachable at a remote URL,
+ * which providers like IETI Agents Proxy refuse, failing the whole request.
+ */
 function imageUrl(block: Block): string | undefined {
-  const source = block.source as { type?: string; media_type?: string; data?: string; url?: string } | undefined
+  const source = block.source as { type?: string; media_type?: string; data?: string } | undefined
   if (source?.type === 'base64' && source.data) return `data:${source.media_type ?? 'image/png'};base64,${source.data}`
-  if (source?.type === 'url' && source.url) return source.url
   return undefined
 }
 
@@ -239,6 +242,7 @@ export function toOpenAiMessages(
         const url = images ? imageUrl(block) : undefined
         if (url) parts.push({ type: 'image_url', image_url: { url } })
         else if (!images) parts.push({ type: 'text', text: '[image omitted: this model has no image input]' })
+        else parts.push({ type: 'text', text: '[image omitted: only inline images are sent]' })
       }
       if (block.type === 'document') parts.push({ type: 'text', text: '[document omitted]' })
     }
