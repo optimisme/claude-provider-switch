@@ -819,7 +819,7 @@ export const register: Register = (on, options) => {
                 )}
               </Box>
               {p && !isConfig && (
-                <Button key={`remove:${p.id}`} label="Remove…" plain dimColor onPress={() => void askRemove($, p.id)} />
+                <Button key={`remove:${p.id}`} label="🗑" plain dimColor onPress={() => void askRemove($, p.id)} />
               )}
             </Box>
           )}
