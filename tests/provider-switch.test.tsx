@@ -662,6 +662,60 @@ test('Claude has its own context settings: an off tool is deferred, an off remin
   expect((await ui.find({ key: 'server:docs' }))?.text).toMatch(/^◐ docs \(MCP, 1\/2 tools\)/)
 })
 
+test('Lean switches off what a coding turn can do without, and Restore all brings it back', async ($, on) => {
+  world(on, { routes: {} })
+  on('tool.describe', (_, e) => ({ description: e.description }))
+  on('prompt.attachment', (_, e) => ({ text: e.text }))
+  await start($)
+  const core = { plugin: 'engine', tier: 'core' }
+  await $.tool.describe({ tool: 'Bash', description: 'Runs a command.', provider: core } as never)
+  await $.tool.describe({ tool: 'WebFetch', description: 'Fetches a page.', provider: core } as never)
+  await $.prompt.attachment({ type: 'skill_listing', text: 'Skills: a, b, c', origin: { kind: 'engine' } } as never)
+  const hook = { type: 'hook_additional_context', text: 'x'.repeat(4000), origin: { kind: 'hook', event: 'SessionStart' } }
+  await $.prompt.attachment(hook as never)
+
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  await ui.press({ key: 'context-toggle' })
+  // Everything on: Lean is offered, Restore all is not.
+  expect((await ui.find({ key: 'context-lean' }))?.text).toMatch(/^Lean · saves ~\dk$/)
+  expect(await ui.find({ key: 'context-restore' })).toBeUndefined()
+
+  await ui.press({ key: 'context-lean' })
+  expect((await ui.find({ key: 'tool:Bash' }))?.text).toMatch(/^☑ Bash/)
+  expect((await ui.find({ key: 'tool:WebFetch' }))?.text).toMatch(/^☐ WebFetch/)
+  // Claude keeps the engine's listings (its Skill and ToolSearch need them), not hooks' context.
+  expect((await ui.find({ key: 'inject:skill_listing' }))?.text).toMatch(/^☑ skill_listing/)
+  expect((await ui.find({ key: 'inject:hook:SessionStart' }))?.text).toMatch(/^☐ SessionStart hook/)
+  expect((await $.tool.describe({ tool: 'WebFetch', description: 'Fetches a page.', provider: core } as never)).isDeferred).toBe(true)
+  expect((await $.prompt.attachment(hook as never)).text).toBeNull()
+  expect(await ui.find({ key: 'context-lean' })).toBeUndefined()
+
+  await ui.press({ key: 'context-restore' })
+  expect((await ui.find({ key: 'tool:WebFetch' }))?.text).toMatch(/^☑ WebFetch/)
+  expect((await ui.find({ key: 'inject:hook:SessionStart' }))?.text).toMatch(/^☑ SessionStart hook/)
+  expect(await ui.find({ key: 'context-restore' })).toBeUndefined()
+  expect(await ui.find({ key: 'context-lean' })).toBeDefined()
+})
+
+test("a provider's Lean also drops the engine's listings, which its model cannot use", { options: OPTIONS }, async ($, on) => {
+  world(on, {
+    routes: { 'https://proxy.test/v1/models': { json: { data: [{ id: 'qwen' }] } } },
+    tools: ['Read', 'Bash', 'WebFetch', 'Agent'],
+  })
+  on('prompt.attachment', (_, e) => ({ text: e.text }))
+  await start($)
+  await $.command.run(provider('qwen'))
+  await $.prompt.attachment({ type: 'skill_listing', text: 'Skills: a, b, c', origin: { kind: 'engine' } } as never)
+
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  await ui.press({ key: 'context-toggle' })
+  await ui.press({ key: 'context-lean' })
+  expect((await ui.find({ key: 'tool:Read' }))?.text).toMatch(/^☑ Read/)
+  expect((await ui.find({ key: 'tool:Agent' }))?.text).toMatch(/^☐ Agent/)
+  expect((await ui.find({ key: 'inject:skill_listing' }))?.text).toMatch(/^☐ skill_listing/)
+  expect(await ui.find({ key: 'context-restore' })).toBeDefined()
+})
+
 test('a provider not in use offers its models, and picking one switches to it', async ($, on) => {
   world(on, {
     routes: { 'https://api.deepseek.test/v1/models': { json: { data: [{ id: 'deepseek-chat' }, { id: 'deepseek-reasoner' }] } } },

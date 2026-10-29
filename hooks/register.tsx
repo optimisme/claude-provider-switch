@@ -60,6 +60,11 @@ const EMPTY_DRAFT: Draft = { name: '', url: '', key: '' }
 // the person chose), never offered to switch off.
 const KEPT_INJECTIONS = /^(file|edited_text_file|queued_command|plan_mode.*|auto_mode.*)$/
 
+// What the Lean preset keeps: the tools a coding turn needs (ToolSearch, so Claude can still
+// load the rest), and the context blocks worth their tokens. System prompt sections all stay.
+const LEAN_TOOLS = new Set(['Bash', 'Read', 'Write', 'Edit', 'Glob', 'Grep', 'ToolSearch'])
+const LEAN_BLOCKS = new Set(['claudeMd', 'currentDate'])
+
 // Share of a model's context window at which the mod warns, once per model.
 const CONTEXT_WARN = 0.8
 
@@ -191,6 +196,22 @@ function byServer(items: readonly ContextItem[]): [string, ContextItem[]][] {
     }
   }
   return out
+}
+
+/**
+ * The items the Lean preset switches off: tools beyond LEAN_TOOLS, context blocks beyond
+ * LEAN_BLOCKS, hooks' and plugins' context, and, for a provider (which gets no Skill or
+ * ToolSearch), the engine's reminders and listings too.
+ */
+function leanOff(isClaude: boolean, tools: readonly ContextItem[], injected: readonly ContextItem[]): string[] {
+  const isKept = (id: string) => {
+    if (id.startsWith('block:')) return LEAN_BLOCKS.has(id.slice('block:'.length))
+    return isClaude && id.startsWith('inject:') && !/^inject:(hook|plugin):/.test(id)
+  }
+  return [
+    ...tools.filter(t => !LEAN_TOOLS.has(t.label)).map(t => t.id),
+    ...injected.filter(i => !isKept(i.id)).map(i => i.id),
+  ]
 }
 
 async function noteSeen($: EngineInterface, group: 'tools' | 'injected', item: ContextItem) {
@@ -864,6 +885,14 @@ export const register: Register = (on, options) => {
       const sum = (items: readonly ContextItem[]) => items.filter(i => !off.includes(i.id)).reduce((n, i) => n + i.tokens, 0)
       const total = groups.reduce((n, g) => n + sum(g.items), 0)
       const everything = groups.reduce((n, g) => n + g.items.reduce((m, i) => m + i.tokens, 0), 0)
+      // One preset button: Lean while everything is on, Restore all once anything is off.
+      const lean = leanOff(sel.provider !== 'proxy', tools, seen.injected)
+      const leanSaves = groups.flatMap(g => g.items).filter(i => lean.includes(i.id)).reduce((n, i) => n + i.tokens, 0)
+      const preset = off.length ? (
+        <Button key="context-restore" label="Restore all" onPress={() => void setContextOff($, target, off, false)} />
+      ) : lean.length ? (
+        <Button key="context-lean" label={`Lean · saves ~${kTokens(leanSaves)}`} onPress={() => void setContextOff($, target, lean, true)} />
+      ) : null
       const itemRow = (item: ContextItem) => {
         const isOn = !off.includes(item.id)
         return (
@@ -928,6 +957,11 @@ export const register: Register = (on, options) => {
                   ? `Sent to ${targetName} with every request, before the conversation. Off items are left out.`
                   : 'Sent to Claude with every request, before the conversation. Off tools wait behind ToolSearch; other off items are left out.'}
               </Text>
+              {preset && (
+                <Box flexDirection="row" justifyContent="center">
+                  {preset}
+                </Box>
+              )}
               {groups.map(g => {
                 const ids = g.items.map(i => i.id)
                 return (

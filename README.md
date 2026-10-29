@@ -43,6 +43,13 @@ DeepSeek, OpenAI, OpenRouter, Groq, Mistral, a local Ollama or vLLM, and so on.
     first message's context blocks (`claudeMd`, `userEmail`, ...). Mentioned
     files and queued prompts are never offered.
 
+  While everything is on, **Lean** switches off what a coding turn can do
+  without: tools other than Bash, Read, Write, Edit, Glob, Grep and ToolSearch,
+  hooks' and plugins' context, context blocks other than `claudeMd` and
+  `currentDate`, and, for a provider, the engine's reminders and listings.
+  System prompt sections stay on. Once anything is off, **Restore all** switches
+  everything back on.
+
   The choice is kept per provider, across sessions. System prompt sections and
   injected context are listed once a request has carried them.
 - **Button above the prompt**: `⇄ Claude` or `⇄ <model> (<provider>) · <n>% ctx`;
