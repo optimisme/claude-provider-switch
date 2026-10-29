@@ -1,6 +1,6 @@
 {
   "name": "provider-switch",
-  "version": "0.2.2",
+  "version": "0.2.3",
   "description": "Switch Claude Code between Claude and the models of OpenAI-compatible providers (IETI Agents Proxy, DeepSeek, OpenAI, OpenRouter, Ollama...) from a pane",
   "author": { "name": "optimisme" },
   "repository": "https://github.com/optimisme/claude-provider-switch",

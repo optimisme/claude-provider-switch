@@ -47,6 +47,8 @@ const NEW = '+new'
 const EMPTY_DRAFT: Draft = { name: '', url: '', key: '' }
 // Columns of the pane's form labels, so the fields line up.
 const LABEL_WIDTH = 15
+// Narrowest a field's control gets beside its label; below this it wraps under the label.
+const FIELD_MIN_WIDTH = 16
 
 // Share of a model's context window at which the mod warns, once per model.
 const CONTEXT_WARN = 0.8
@@ -554,7 +556,7 @@ export const register: Register = (on, options) => {
     const bar = await barView($)
     return (
       <Box flexDirection="row" justifyContent="space-between" alignItems="center" columnGap={1}>
-        <Box flexDirection="row" flexWrap="wrap" alignItems="center" columnGap={1} flexShrink={1}>
+        <Box flexDirection="row" flexWrap="wrap" alignItems="center" columnGap={1} flexShrink={1} minWidth={0}>
           <Text>
             Provider Switch: <Text bold>{bar.name}</Text>
           </Text>
@@ -656,11 +658,11 @@ export const register: Register = (on, options) => {
 
     /** A label in a fixed column and its control beside it, so every field of a form lines up. */
     const field = (label: string, control: RenderElement) => (
-      <Box flexDirection="row" alignItems="center" columnGap={1}>
+      <Box flexDirection="row" flexWrap="wrap" alignItems="center" columnGap={1}>
         <Box width={LABEL_WIDTH} flexShrink={0}>
           <Text dimColor>{label}</Text>
         </Box>
-        <Box flexGrow={1} flexShrink={1}>
+        <Box flexGrow={1} flexShrink={1} minWidth={FIELD_MIN_WIDTH}>
           {control}
         </Box>
       </Box>
@@ -695,7 +697,7 @@ export const register: Register = (on, options) => {
                 'URL',
                 <Input
                   key="form-url"
-                  placeholder="https://api.deepseek.com (no path → /v1)"
+                  placeholder="https://api.deepseek.com"
                   value={d.url}
                   onInput={value => void setDraft($, 'url', value)}
                   onSubmit={value => void setDraft($, 'url', value)}
@@ -705,7 +707,7 @@ export const register: Register = (on, options) => {
                 'API key',
                 <Input
                   key="form-key"
-                  placeholder={p?.keyHint ? `…${p.keyHint} (empty keeps it)` : 'optional'}
+                  placeholder={p?.keyHint ? `…${p.keyHint} (kept if empty)` : 'optional'}
                   value={d.key}
                   submitLabel="save"
                   onInput={value => void setDraft($, 'key', value)}
@@ -771,7 +773,7 @@ export const register: Register = (on, options) => {
             'Context window',
             <Input
               key="context"
-              placeholder={`as reported (${reported.contextWindow ? kTokens(reported.contextWindow) : 'unknown'}), e.g. 128k`}
+              placeholder={`reported: ${reported.contextWindow ? kTokens(reported.contextWindow) : 'unknown'}`}
               value={override?.contextWindow ? kTokens(override.contextWindow) : ''}
               submitLabel="save"
               onSubmit={value => void setContextWindow($, selKey, value)}
@@ -794,10 +796,13 @@ export const register: Register = (on, options) => {
           borderDimColor={!isSelected}
           paddingX={1}
         >
-          <Box flexDirection="row" justifyContent="space-between" alignItems="center" columnGap={1}>
-            <Box flexShrink={1}>
+          <Box flexDirection="row" flexWrap="wrap" justifyContent="space-between" alignItems="center" columnGap={1}>
+            <Box flexShrink={1} minWidth={0}>
               <Button key={`pick:${id}`} plain onPress={() => void pickProvider($, id)}>
-                <Text color={isSelected ? 'claude' : undefined}>{isSelected ? '●' : '○'}</Text> <Text bold>{name}</Text>
+                <Text color={isSelected ? 'claude' : undefined}>{isSelected ? '●' : '○'}</Text>{' '}
+                <Text bold wrap="truncate-end">
+                  {name}
+                </Text>
               </Button>
             </Box>
             {p && <Button key={`edit:${id}`} label={open === id ? 'Close' : 'Edit'} dimColor={open !== id} onPress={() => void toggleForm($, id)} />}
@@ -813,11 +818,11 @@ export const register: Register = (on, options) => {
 
     return (
       <Box flexDirection="column" rowGap="sm">
-        <Box flexDirection="row" justifyContent="space-between" alignItems="center">
+        <Box flexDirection="row" flexWrap="wrap" justifyContent="space-between" alignItems="center" columnGap={1}>
           <Text size="heading" bold>
             Providers
           </Text>
-          <Box flexDirection="row" columnGap={1}>
+          <Box flexDirection="row" flexWrap="wrap" columnGap={1}>
             <Button key="reload" label={isLoading ? 'Reloading…' : 'Reload all'} dimColor onPress={() => void reloadAll($)} />
             <Button
               key="add"
