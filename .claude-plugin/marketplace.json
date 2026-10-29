@@ -1,0 +1,12 @@
+{
+  "name": "claude-provider-switch",
+  "owner": { "name": "optimisme" },
+  "description": "Claude Code mod to switch between Claude and OpenAI-compatible proxy models",
+  "plugins": [
+    {
+      "name": "provider-switch",
+      "source": "./",
+      "description": "Switch Claude Code between Claude and an OpenAI-compatible proxy (e.g. IETI Agents Proxy) from a pane"
+    }
+  ]
+}

@@ -1,0 +1,23 @@
+{
+  "name": "provider-switch",
+  "version": "0.1.0",
+  "description": "Switch Claude Code between Claude and an OpenAI-compatible proxy (e.g. IETI Agents Proxy) from a pane",
+  "author": { "name": "optimisme" },
+  "repository": "https://github.com/optimisme/claude-provider-switch",
+  "types": "./types/index.d.ts",
+  "userConfig": {
+    "proxyUrl": {
+      "type": "string",
+      "title": "Proxy URL",
+      "description": "Base URL of the OpenAI-compatible proxy, e.g. https://agents.example.com (\"/v1\" is added if missing). Can also be set from the pane.",
+      "default": ""
+    },
+    "apiKey": {
+      "type": "string",
+      "title": "Proxy API key",
+      "description": "API key for the proxy (ieti_sk_...). Kept in secure storage. A key typed in the pane takes precedence.",
+      "sensitive": true,
+      "default": ""
+    }
+  }
+}
