@@ -578,3 +578,60 @@ test('a thinking model gets its reasoning back with the tool calls it made', { o
     'I should list the files.',
   )
 })
+
+test('context tools switched off for a provider are not sent, and the pane counts their tokens', { options: OPTIONS }, async ($, on) => {
+  const requests = world(on, {
+    routes: {
+      'https://proxy.test/v1/models': { json: { data: [{ id: 'qwen' }] } },
+      'https://proxy.test/v1/chat/completions': reply('ok'),
+    },
+    tools: ['Read', 'Bash', 'mcp__x__y'],
+  })
+  await start($)
+  await $.command.run(provider('qwen'))
+  await $.prompt.compose({ model: 'claude-opus-5-5', promptModel: 'claude-opus-5-5', surfaces: ['desktop'], tools: ['Read'], outputStyle: null, traits: [] })
+
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  // Only tools with a known schema are listed, each on and with its cost.
+  expect(await ui.find({ key: 'tool:mcp__x__y' })).toBeUndefined()
+  expect((await ui.find({ key: 'tool:Bash' }))?.text).toMatch(/^☑ Bash · ~\d+$/)
+  const total = async () => (await ui.find({ type: 'Text', text: /^Tools ~/ }))?.text
+  expect(await total()).toMatch(/^Tools ~\d+ tokens \+ system prompt ~\d+ = ~\d+ per request$/)
+  const before = await total()
+
+  await ui.press({ key: 'tool:Bash' })
+  expect((await ui.find({ key: 'tool:Bash' }))?.text).toMatch(/^☐ Bash/)
+  expect(await total()).not.toBe(before)
+  await ui.unmount()
+
+  await drain($.turn.step(step()))
+  const sent = JSON.parse(requests.find(r => r.url.endsWith('/chat/completions'))?.body ?? '{}')
+  expect(sent.tools.map((t: { function: { name: string } }) => t.function.name)).toEqual(['Read'])
+
+  // None sends no tools at all; the choice is kept for the next session.
+  const again = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  await again.press({ key: 'tools-none' })
+  expect((await again.find({ type: 'Text', text: /^Tools ~/ }))?.text).toMatch(/^Tools ~0 tokens/)
+  await again.press({ key: 'tools-all' })
+  expect((await again.find({ key: 'tool:Bash' }))?.text).toMatch(/^☑ Bash/)
+})
+
+test('a provider not in use offers its models, and picking one switches to it', async ($, on) => {
+  world(on, {
+    routes: { 'https://api.deepseek.test/v1/models': { json: { data: [{ id: 'deepseek-chat' }, { id: 'deepseek-reasoner' }] } } },
+  })
+  await start($)
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  await ui.press({ key: 'add' })
+  await ui.input({ key: 'form-name', text: 'DeepSeek', kind: 'change' })
+  await ui.input({ key: 'form-url', text: 'https://api.deepseek.test', kind: 'change' })
+  await ui.press({ key: 'save-provider' })
+
+  expect((await ui.find({ type: 'Text', text: /^Using / }))?.text).toBe('Using Claude')
+  expect((await ui.find({ key: 'model:deepseek' }))?.props.options).toHaveLength(3)
+  await ui.select({ key: 'model:deepseek', value: 'proxy:deepseek/deepseek-reasoner' })
+  expect((await ui.find({ type: 'Text', text: /^Using / }))?.text).toBe('Using deepseek-reasoner via DeepSeek')
+  // Selected, the row shows the full model settings instead.
+  expect(await ui.find({ key: 'model:deepseek' })).toBeUndefined()
+  expect((await ui.find({ key: 'model' }))?.props.value).toBe('proxy:deepseek/deepseek-reasoner')
+})

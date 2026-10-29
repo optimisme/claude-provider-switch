@@ -29,6 +29,11 @@ DeepSeek, OpenAI, OpenRouter, Groq, Mistral, a local Ollama or vLLM, and so on.
   - After each answer the pane and the button show how full the context is;
     at 80% a toast suggests `/compact` or switching to Claude. A conversation
     already larger than the window is stopped before it is sent.
+- **Context tools**: under the selected provider, one toggle per tool its
+  models can be offered, each with about how many prompt tokens its schema
+  costs, plus **All** and **None**. The total below adds the system prompt, so
+  you see what every request spends before the conversation. The choice is kept
+  per provider, across sessions.
 - **Button above the prompt**: `⇄ Claude` or `⇄ <model> (<provider>) · <n>% ctx`;
   press it to open the pane.
 - **`/provider`**: opens the pane. `/provider <model>` selects the first
@@ -101,7 +106,7 @@ With Claude selected, requests pass through untouched.
 - A provider's model is offered these tools only: Bash, Read, Write, Edit, Glob,
   Grep, WebFetch, WebSearch and Agent. The mod API does not expose built-in tool
   schemas, so they are written out in `hooks/schemas.ts`. MCP and other tools
-  are not offered.
+  are not offered, and any of these can be switched off under **Context tools**.
 - Thinking blocks, documents and prompt caching are not forwarded. Reasoning
   models that expect their reasoning sent back during a tool loop may fail.
 - Models only reachable through OpenAI's Responses API, and Azure OpenAI's URL

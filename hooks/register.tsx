@@ -26,6 +26,7 @@ const providers = atom({ plugin: 'provider-switch', key: 'providers' } as const,
 const catalogs = atom({ plugin: 'provider-switch', key: 'catalogs' } as const, {} as Record<string, Catalog>)
 const overrides = atom({ plugin: 'provider-switch', key: 'overrides' } as const, {} as Record<string, Override>)
 const context = atom({ plugin: 'provider-switch', key: 'context' } as const, null as ContextUse | null)
+const disabledTools = atom({ plugin: 'provider-switch', key: 'disabledTools' } as const, {} as Record<string, string[]>)
 const draft = atom({ plugin: 'provider-switch', key: 'draft' } as const, { name: '', url: '', key: '' } as Draft)
 const editing = atom({ plugin: 'provider-switch', key: 'editing' } as const, null as string | null)
 const removing = atom({ plugin: 'provider-switch', key: 'removing' } as const, null as string | null)
@@ -37,6 +38,7 @@ const STORE_KEYS = 'keys' // { [providerId]: key }
 const STORE_OVERRIDES = 'overrides' // { [providerId/model]: Override }
 const STORE_SELECTION = 'selection'
 const STORE_LAST_MODELS = 'lastModels' // { [providerId]: model }, what picking the provider again selects
+const STORE_DISABLED_TOOLS = 'disabledTools' // { [providerId]: tool names switched off }
 // Before named providers: one URL and key typed in the pane.
 const LEGACY_URL = 'proxyUrl'
 const LEGACY_KEY = 'apiKey'
@@ -108,6 +110,35 @@ function describe(info: ModelInfo): string {
   if (info.tools !== undefined) parts.push(info.tools ? 'tools' : 'no tools')
   if (info.reasoning) parts.push('reasoning')
   return parts.length ? parts.join(' · ') : 'capabilities unknown'
+}
+
+/**
+ * The tools of this session a provider's model can call, in chat-completions form:
+ * those with a known schema, less the ones switched off for the provider.
+ */
+async function offeredTools($: EngineInterface, off: readonly string[] = []): Promise<OpenAiTool[]> {
+  return (await $.tool.list())
+    .filter(t => KNOWN_SCHEMAS[t.name] && !off.includes(t.name))
+    .map(t => ({
+      type: 'function',
+      function: { name: t.name, description: t.description, parameters: KNOWN_SCHEMAS[t.name]! },
+    }))
+}
+
+/** About how many prompt tokens offering `tool` costs each request. */
+function toolTokens(tool: OpenAiTool): number {
+  return estimateTokens(JSON.stringify(tool))
+}
+
+/** Switch tools on or off for a provider: `names` flip to `isOff`. */
+async function setToolsOff($: EngineInterface, providerId: string, names: readonly string[], isOff: boolean) {
+  const all = ((await $.store.get(STORE_DISABLED_TOOLS)) as Record<string, string[]> | undefined) ?? {}
+  const kept = (all[providerId] ?? []).filter(n => !names.includes(n))
+  const off = isOff ? [...kept, ...names] : kept
+  const { [providerId]: _, ...rest } = all
+  const next = off.length ? { ...rest, [providerId]: off } : rest
+  await $.store.set(STORE_DISABLED_TOOLS, next)
+  await update($, disabledTools, () => next)
 }
 
 async function storedProviders($: EngineInterface): Promise<StoredProvider[]> {
@@ -436,6 +467,8 @@ export const register: Register = (on, options) => {
     }
     const stored = ((await $.store.get(STORE_OVERRIDES)) as Record<string, Override> | undefined) ?? {}
     await update($, overrides, () => stored)
+    const off = ((await $.store.get(STORE_DISABLED_TOOLS)) as Record<string, string[]> | undefined) ?? {}
+    await update($, disabledTools, () => off)
     await syncProviders($)
     // The backend now shows as a button above the prompt; clear the line an older version set.
     $.ui.status(undefined)
@@ -525,12 +558,7 @@ export const register: Register = (on, options) => {
     const key = modelKey(provider.id, sel.model)
     const info = effectiveInfo((await read($, catalogs))[provider.id], (await read($, overrides))[key], sel.model)
     // Only a model its provider says lacks tools gets none; unknown means try.
-    const tools: OpenAiTool[] = (info.tools === false ? [] : await $.tool.list())
-      .filter(t => KNOWN_SCHEMAS[t.name])
-      .map(t => ({
-        type: 'function',
-        function: { name: t.name, description: t.description, parameters: KNOWN_SCHEMAS[t.name]! },
-      }))
+    const tools = info.tools === false ? [] : await offeredTools($, (await read($, disabledTools))[provider.id])
 
     const request = (fillReasoning: boolean) =>
       JSON.stringify({
@@ -659,6 +687,8 @@ export const register: Register = (on, options) => {
     const d = await read($, draft)
     const open = await read($, editing)
     const confirming = await read($, removing)
+    const off = sel.provider === 'proxy' ? ((await read($, disabledTools))[sel.providerId] ?? []) : []
+    const known = sel.provider === 'proxy' ? await offeredTools($) : []
 
     const selKey = sel.provider === 'proxy' ? modelKey(sel.providerId, sel.model) : ''
     const selName = sel.provider === 'proxy' ? (list.find(p => p.id === sel.providerId)?.name ?? sel.providerId) : ''
@@ -685,6 +715,57 @@ export const register: Register = (on, options) => {
         {info.tools === false && <Text dimColor>This model gets no tools: it can only answer in text.</Text>}
       </Box>
     )
+
+    /**
+     * Context tools: the selected provider's tools, each switched on or off with what it
+     * costs, and the total its model is sent before the conversation.
+     */
+    const toolSettings = () => {
+      if (sel.provider !== 'proxy' || info.tools === false) return null
+      const id = sel.providerId
+      const names = known.map(t => t.function.name)
+      const toolsTotal = known.filter(t => !off.includes(t.function.name)).reduce((n, t) => n + toolTokens(t), 0)
+      const systemTotal = systemPrompt ? estimateTokens(systemPrompt) : 0
+      return (
+        <Box key="context-tools" flexDirection="column" rowGap="xs" marginTop="xs">
+          <Box flexDirection="row" flexWrap="wrap" justifyContent="space-between" alignItems="center" columnGap={1}>
+            <Text size="caption" dimColor>
+              Context tools
+            </Text>
+            {known.length > 0 && (
+              <Box flexDirection="row" flexWrap="wrap" columnGap={1}>
+                <Button key="tools-all" label="All" plain dimColor onPress={() => void setToolsOff($, id, names, false)} />
+                <Button key="tools-none" label="None" plain dimColor onPress={() => void setToolsOff($, id, names, true)} />
+              </Box>
+            )}
+          </Box>
+          {known.length ? (
+            <Box flexDirection="row" flexWrap="wrap" columnGap={1} rowGap="xs">
+              {known.map(t => {
+                const name = t.function.name
+                const isOn = !off.includes(name)
+                return (
+                  <Button
+                    key={`tool:${name}`}
+                    label={`${isOn ? '☑' : '☐'} ${name} · ~${kTokens(toolTokens(t))}`}
+                    dimColor={!isOn}
+                    onPress={() => void setToolsOff($, id, [name], isOn)}
+                  />
+                )
+              })}
+            </Box>
+          ) : (
+            <Text size="caption" dimColor>
+              No tool in this session has a schema the mod knows.
+            </Text>
+          )}
+          <Text size="caption" dimColor>
+            {`Tools ~${kTokens(toolsTotal)} tokens`}
+            {systemTotal ? ` + system prompt ~${kTokens(systemTotal)} = ~${kTokens(toolsTotal + systemTotal)} per request` : ' per request'}
+          </Text>
+        </Box>
+      )
+    }
 
     /** One provider's status: `3 chat models`, `loading…` or its error. */
     const stateOf = (id: string) => {
@@ -718,6 +799,7 @@ export const register: Register = (on, options) => {
                 onPress={() => void choose($, `${PROXY_PREFIX}${sel.providerId}/${model}`)}
               />
             ))}
+          {toolSettings()}
           <Button key="reload" label={isLoading ? 'Reloading…' : 'Reload all'} onPress={() => void reloadAll($)} />
         </Box>
       )
@@ -827,14 +909,37 @@ export const register: Register = (on, options) => {
       )
     }
 
+    /** A provider's models as Select options, with each one's context window when known. */
+    const modelOptions = (id: string, models: readonly string[]) =>
+      models.map(model => {
+        const w = effectiveInfo(all[id], set[modelKey(id, model)], model).contextWindow
+        return { value: `${PROXY_PREFIX}${id}/${model}`, label: w ? `${model} · ${kTokens(w)}` : model }
+      })
+
+    /** The model picker of a provider not in use: picking one switches to it. */
+    const modelPicker = (id: string) => {
+      const models = all[id]?.models ?? []
+      if (!models.length) return null
+      return (
+        <Box flexDirection="column" marginTop="xs">
+          {field(
+            'Model',
+            <Select
+              key={`model:${id}`}
+              options={[{ value: '', label: 'not in use: pick a model' }, ...modelOptions(id, models)]}
+              value=""
+              onSelect={value => void (value && choose($, value))}
+            />,
+          )}
+        </Box>
+      )
+    }
+
     /** The selected provider's model and the person's overrides for it. */
     const modelSettings = () => {
       if (sel.provider !== 'proxy') return null
       const models = all[sel.providerId]?.models ?? []
-      const options = (models.includes(sel.model) ? models : [sel.model, ...models]).map(model => {
-        const w = effectiveInfo(all[sel.providerId], set[modelKey(sel.providerId, model)], model).contextWindow
-        return { value: `${PROXY_PREFIX}${sel.providerId}/${model}`, label: w ? `${model} · ${kTokens(w)}` : model }
-      })
+      const options = modelOptions(sel.providerId, models.includes(sel.model) ? models : [sel.model, ...models])
       const override = set[selKey]
       return (
         <Box flexDirection="column" rowGap="xs" marginTop="xs">
@@ -870,6 +975,7 @@ export const register: Register = (on, options) => {
               onSubmit={value => void setContextWindow($, selKey, value)}
             />,
           )}
+          {toolSettings()}
         </Box>
       )
     }
@@ -901,7 +1007,7 @@ export const register: Register = (on, options) => {
           <Text size="caption" dimColor={!isError} color={isError ? 'error' : undefined} wrap="truncate-end">
             {detail}
           </Text>
-          {isSelected && modelSettings()}
+          {isSelected ? modelSettings() : p && modelPicker(id)}
           {p && open === id && form(p)}
         </Box>
       )

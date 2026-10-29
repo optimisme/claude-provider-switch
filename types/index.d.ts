@@ -64,6 +64,8 @@ declare module 'claude-code' {
       /** Per `<providerId>/<model>`. */
       overrides: Record<string, Override>
       context: ContextUse | null
+      /** Per provider id: the tools the person switched off for it. */
+      disabledTools: Record<string, string[]>
       draft: Draft
       /** The provider whose form is open in the pane: its id, `+new` for the add form, or none. */
       editing: string | null
