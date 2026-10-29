@@ -15,7 +15,7 @@ export type OpenAiToolCall = {
 export type OpenAiMessage =
   | { role: 'system'; content: string }
   | { role: 'user'; content: string | OpenAiUserPart[] }
-  | { role: 'assistant'; content: string | null; tool_calls?: OpenAiToolCall[] }
+  | { role: 'assistant'; content: string | null; tool_calls?: OpenAiToolCall[]; reasoning_content?: string }
   | { role: 'tool'; tool_call_id: string; content: string }
 
 type OpenAiUserPart =
@@ -30,6 +30,8 @@ export type OpenAiTool = {
 /** What the proxy answered, reduced to what a turn step needs. */
 export type Reply = {
   text: string
+  /** A thinking model's `reasoning_content` (DeepSeek and those like it); empty when none. */
+  reasoning: string
   toolCalls: { id: string; name: string; arguments: string }[]
   stopReason: 'end_turn' | 'max_tokens' | 'tool_use'
   usage: { input_tokens: number; output_tokens: number }
@@ -174,11 +176,20 @@ export function estimateTokens(body: string): number {
 /**
  * The conversation, with `system` first, in chat-completions form. With
  * `images: false` each image becomes a short note, for a model without vision.
+ *
+ * `reasoning` gives back, by tool call id, the `reasoning_content` a thinking
+ * model sent with the reply that made the call: DeepSeek's thinking mode refuses
+ * a tool call sent back without it. With `fillReasoning`, a call whose reasoning
+ * is unknown (a reply from before, another model) gets an empty one.
  */
 export function toOpenAiMessages(
   system: string,
   messages: readonly AnthropicMessage[],
-  { images = true }: { images?: boolean } = {},
+  {
+    images = true,
+    reasoning = {},
+    fillReasoning = false,
+  }: { images?: boolean; reasoning?: Readonly<Record<string, string>>; fillReasoning?: boolean } = {},
 ): OpenAiMessage[] {
   const out: OpenAiMessage[] = []
   if (system) out.push({ role: 'system', content: system })
@@ -196,7 +207,13 @@ export function toOpenAiMessages(
           type: 'function',
           function: { name: String(b.name), arguments: JSON.stringify(b.input ?? {}) },
         }))
-      out.push({ role: 'assistant', content: text || null, ...(calls.length ? { tool_calls: calls } : {}) })
+      const thought = calls.map(c => reasoning[c.id]).find(r => r !== undefined) ?? (fillReasoning && calls.length ? '' : undefined)
+      out.push({
+        role: 'assistant',
+        content: text || null,
+        ...(calls.length ? { tool_calls: calls } : {}),
+        ...(thought !== undefined ? { reasoning_content: thought } : {}),
+      })
       continue
     }
 
@@ -240,6 +257,7 @@ export function parseReply(body: string, requestedModel: string): Reply {
       finish_reason?: string
       message?: {
         content?: string | null
+        reasoning_content?: string | null
         tool_calls?: { id?: string; function?: { name?: string; arguments?: string } }[]
       }
     }[]
@@ -260,6 +278,7 @@ export function parseReply(body: string, requestedModel: string): Reply {
 
   return {
     text: choice.message.content ?? '',
+    reasoning: typeof choice.message.reasoning_content === 'string' ? choice.message.reasoning_content : '',
     toolCalls,
     stopReason,
     usage: {
@@ -278,4 +297,9 @@ export function errorText(status: number, body: string): string {
     detail = typeof json.error === 'string' ? json.error : (json.error?.message ?? body)
   } catch {}
   return `HTTP ${status}${detail ? `: ${detail.slice(0, 300)}` : ''}`
+}
+
+/** Whether a failed call's error is a thinking model asking for its `reasoning_content` back. */
+export function wantsReasoning(status: number, body: string): boolean {
+  return status === 400 && body.includes('reasoning_content')
 }

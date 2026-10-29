@@ -518,3 +518,59 @@ test('Edit opens a provider form: renaming keeps its id and selection, + Add nev
   const listing = (await $.command.run(provider('reload'))).text
   expect(listing).toBe('DeepSeek Work (deepseek): deepseek-chat\nDeepSeek (deepseek-2): deepseek-chat')
 })
+
+test('a thinking model gets its reasoning back with the tool calls it made', { options: OPTIONS }, async ($, on) => {
+  // As DeepSeek's thinking mode answers: refused when a tool call comes back without its reasoning.
+  const strict = (r: Request): Answer => {
+    const sent = JSON.parse(r.body ?? '{}') as { messages: { role: string; tool_calls?: unknown[]; reasoning_content?: string }[] }
+    if (sent.messages.some(m => m.tool_calls && m.reasoning_content === undefined)) {
+      return { status: 400, json: { error: { message: 'The `reasoning_content` in the thinking mode must be passed back to the API.' } } }
+    }
+    const isFirst = !sent.messages.some(m => m.role === 'tool' && JSON.stringify(m).includes('call_new'))
+    return isFirst
+      ? {
+          json: {
+            choices: [
+              {
+                finish_reason: 'tool_calls',
+                message: {
+                  content: null,
+                  reasoning_content: 'I should list the files.',
+                  tool_calls: [{ id: 'call_new', function: { name: 'Read', arguments: '{"file_path":"/r/a"}' } }],
+                },
+              },
+            ],
+          },
+        }
+      : reply('Done.')
+  }
+  const history = [...HISTORY]
+  const requests = world(on, {
+    routes: {
+      'https://proxy.test/v1/models': { json: { data: [{ id: 'deepseek-flash' }] } },
+      'https://proxy.test/v1/chat/completions': strict,
+    },
+    history,
+  })
+  await start($)
+  await $.command.run(provider('deepseek-flash'))
+
+  // HISTORY's toolu_1 predates the plugin keeping reasoning: refused, then sent again with an empty one.
+  const first = await drain($.turn.step(step()))
+  expect(first.result.toolUses).toEqual([{ name: 'Read', input: { file_path: '/r/a' } }])
+  expect(first.chunks.map(c => c.kind)).toEqual(['thinking', 'tool', 'input', 'stop'])
+  const calls = requests.filter(r => r.url.endsWith('/chat/completions'))
+  expect(calls).toHaveLength(2)
+  expect(JSON.parse(calls[1]!.body!).messages.find((m: { tool_calls?: { id: string }[] }) => m.tool_calls?.[0]?.id === 'toolu_1').reasoning_content).toBe('')
+
+  history.push(
+    { role: 'assistant', content: [{ type: 'tool_use', id: 'call_new', name: 'Read', input: { file_path: '/r/a' } }] },
+    { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'call_new', content: 'a' }] },
+  )
+  const second = await drain($.turn.step(step(1)))
+  expect(second.result.answer).toBe('Done.')
+  const last = JSON.parse(requests.filter(r => r.url.endsWith('/chat/completions')).at(-1)!.body!)
+  expect(last.messages.find((m: { tool_calls?: { id: string }[] }) => m.tool_calls?.[0]?.id === 'call_new').reasoning_content).toBe(
+    'I should list the files.',
+  )
+})

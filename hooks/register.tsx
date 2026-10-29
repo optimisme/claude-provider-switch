@@ -13,6 +13,7 @@ import {
   parseReply,
   parseTokens,
   toOpenAiMessages,
+  wantsReasoning,
 } from './openai'
 import type { AnthropicMessage, OpenAiTool } from './openai'
 import { KNOWN_SCHEMAS } from './schemas'
@@ -59,6 +60,11 @@ let pluginOptions: PluginOptions = {}
 let systemPrompt = ''
 // The model whose context the mod last warned about, so each crossing warns once.
 let warnedModel = ''
+// A thinking model's `reasoning_content`, by the id of each tool call its reply made: the
+// transcript keeps no thinking a hook streams, so the next request gets it back from here.
+const reasonings = new Map<string, string>()
+// The most tool calls whose reasoning is kept; older ones are dropped first.
+const REASONINGS_KEPT = 500
 
 /** `90000` → `90k`. */
 function kTokens(n: number): string {
@@ -490,14 +496,19 @@ export const register: Register = (on, options) => {
         function: { name: t.name, description: t.description, parameters: KNOWN_SCHEMAS[t.name]! },
       }))
 
-    const body = {
-      model: sel.model,
-      messages: toOpenAiMessages(systemPrompt, history as unknown as AnthropicMessage[], { images: info.image !== false }),
-      ...(tools.length ? { tools } : {}),
-      stream: false,
-    }
+    const request = (fillReasoning: boolean) =>
+      JSON.stringify({
+        model: sel.model,
+        messages: toOpenAiMessages(systemPrompt, history as unknown as AnthropicMessage[], {
+          images: info.image !== false,
+          reasoning: Object.fromEntries(reasonings),
+          fillReasoning,
+        }),
+        ...(tools.length ? { tools } : {}),
+        stream: false,
+      })
 
-    const payload = JSON.stringify(body)
+    const payload = request(false)
     // Before sending: a conversation already past the window can only fail.
     const estimate = estimateTokens(payload)
     if (info.contextWindow && estimate > info.contextWindow) {
@@ -509,13 +520,19 @@ export const register: Register = (on, options) => {
       return fail(why)
     }
 
-    let reply
-    try {
-      const res = await $.http.fetch(`${apiBase(provider.url)}/chat/completions`, {
+    const send = (body: string) =>
+      $.http.fetch(`${apiBase(provider.url)}/chat/completions`, {
         method: 'POST',
         headers: { 'content-type': 'application/json', ...authHeaders(provider.key) },
-        body: payload,
+        body,
       })
+
+    let reply
+    try {
+      let res = await send(payload)
+      // A thinking model wants reasoning back for a tool call made before it was kept
+      // (an earlier session, another model): send those with an empty one, once.
+      if (!res.ok && wantsReasoning(res.status, res.text)) res = await send(request(true))
       if (!res.ok) throw new Error(errorText(res.status, res.text))
       reply = parseReply(res.text, sel.model)
     } catch (error) {
@@ -527,7 +544,17 @@ export const register: Register = (on, options) => {
 
     await noteContext($, key, reply.usage.input_tokens || estimate, info.contextWindow)
 
+    if (reply.reasoning) {
+      for (const call of reply.toolCalls) reasonings.set(call.id, reply.reasoning)
+      for (const id of reasonings.keys()) {
+        if (reasonings.size <= REASONINGS_KEPT) break
+        reasonings.delete(id)
+      }
+    }
+
     let block = 0
+    // Shown live as thinking; the transcript does not keep it.
+    if (reply.reasoning) yield { kind: 'thinking', index: block++, text: reply.reasoning }
     if (reply.text) yield { kind: 'text', index: block++, text: reply.text }
     const toolUses = []
     for (const call of reply.toolCalls) {
