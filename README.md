@@ -32,9 +32,11 @@ DeepSeek, OpenAI, OpenRouter, Groq, Mistral, a local Ollama or vLLM, and so on.
 - **Context**: a folded section at the bottom of the pane, for whichever
   provider is selected, Claude included. Its header shows about how many
   tokens every request carries before the conversation. Unfolded, it lists
-  each item with its cost and a toggle, plus **All** and **None** per group:
+  each item on its own row with its cost and a toggle, plus **All** and **None** per group:
   - **Tools**: for a provider, the tools its model is offered; for Claude, the
     tool schemas in the prompt (one switched off waits behind ToolSearch).
+    MCP tools (`mcp__<server>__<tool>`) fold into one row per server that
+    switches all of its tools; ▸ unfolds it to switch them one by one.
   - **System prompt**: each section of Claude Code's system prompt.
   - **Injected context**: reminders and listings the engine adds (skills,
     deferred tools, ...), hooks' context (`SessionStart` and others) and the

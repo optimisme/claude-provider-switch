@@ -29,6 +29,7 @@ const context = atom({ plugin: 'provider-switch', key: 'context' } as const, nul
 const contextOff = atom({ plugin: 'provider-switch', key: 'contextOff' } as const, {} as Record<string, string[]>)
 const contextSeen = atom({ plugin: 'provider-switch', key: 'contextSeen' } as const, { tools: [], sections: [], injected: [] } as ContextSeen)
 const isContextOpen = atom({ plugin: 'provider-switch', key: 'isContextOpen' } as const, false)
+const openServers = atom({ plugin: 'provider-switch', key: 'openServers' } as const, [] as string[])
 const draft = atom({ plugin: 'provider-switch', key: 'draft' } as const, { name: '', url: '', key: '' } as Draft)
 const editing = atom({ plugin: 'provider-switch', key: 'editing' } as const, null as string | null)
 const removing = atom({ plugin: 'provider-switch', key: 'removing' } as const, null as string | null)
@@ -168,6 +169,30 @@ async function setContextOff($: EngineInterface, target: string, ids: readonly s
 }
 
 /** Record one item a request carried, keeping the pane's lists in step without needless redraws. */
+/**
+ * Items in their order, each MCP server's tools (`mcp__<server>__<tool>`) gathered at the
+ * place of its first one: `['', [item]]` for an item of its own, `[server, items]` for a server.
+ */
+function byServer(items: readonly ContextItem[]): [string, ContextItem[]][] {
+  const out: [string, ContextItem[]][] = []
+  const servers = new Map<string, ContextItem[]>()
+  for (const item of items) {
+    const server = /^mcp__(.+?)__./.exec(item.label)?.[1]
+    if (!server) {
+      out.push(['', [item]])
+      continue
+    }
+    const known = servers.get(server)
+    if (known) known.push(item)
+    else {
+      const list = [item]
+      servers.set(server, list)
+      out.push([server, list])
+    }
+  }
+  return out
+}
+
 async function noteSeen($: EngineInterface, group: 'tools' | 'injected', item: ContextItem) {
   const seen = await read($, contextSeen)
   const before = seen[group].find(i => i.id === item.id)
@@ -779,6 +804,7 @@ export const register: Register = (on, options) => {
     const off = (await read($, contextOff))[target] ?? []
     const seen = await read($, contextSeen)
     const isOpenContext = await read($, isContextOpen)
+    const shownServers = await read($, openServers)
     const proxyTools = sel.provider === 'proxy' ? await offeredTools($) : []
 
     const selKey = sel.provider === 'proxy' ? modelKey(sel.providerId, sel.model) : ''
@@ -838,6 +864,49 @@ export const register: Register = (on, options) => {
       const sum = (items: readonly ContextItem[]) => items.filter(i => !off.includes(i.id)).reduce((n, i) => n + i.tokens, 0)
       const total = groups.reduce((n, g) => n + sum(g.items), 0)
       const everything = groups.reduce((n, g) => n + g.items.reduce((m, i) => m + i.tokens, 0), 0)
+      const itemRow = (item: ContextItem) => {
+        const isOn = !off.includes(item.id)
+        return (
+          <Button
+            key={item.id}
+            label={`${isOn ? '☑' : '☐'} ${item.label} · ~${kTokens(item.tokens)}`}
+            plain
+            dimColor={!isOn}
+            onPress={() => void setContextOff($, target, [item.id], isOn)}
+          />
+        )
+      }
+      // An MCP server's tools as one row that switches them all, unfolded to switch each.
+      const serverRow = (server: string, items: readonly ContextItem[]) => {
+        const onCount = items.filter(i => !off.includes(i.id)).length
+        const isOpenServer = shownServers.includes(server)
+        const mark = onCount === items.length ? '☑' : onCount ? '◐' : '☐'
+        return (
+          <Box key={`server-row:${server}`} flexDirection="column">
+            <Box flexDirection="row" alignItems="center" columnGap={1}>
+              <Button
+                key={`server-fold:${server}`}
+                label={isOpenServer ? '▾' : '▸'}
+                plain
+                dimColor
+                onPress={() => void update($, openServers, v => (v.includes(server) ? v.filter(x => x !== server) : [...v, server]))}
+              />
+              <Button
+                key={`server:${server}`}
+                label={`${mark} ${server} (MCP, ${onCount}/${items.length} tools) · ~${kTokens(sum(items))}`}
+                plain
+                dimColor={!onCount}
+                onPress={() => void setContextOff($, target, items.map(i => i.id), onCount === items.length)}
+              />
+            </Box>
+            {isOpenServer && (
+              <Box flexDirection="column" paddingLeft={4}>
+                {items.map(item => itemRow({ ...item, label: item.label.slice(`mcp__${server}__`.length) }))}
+              </Box>
+            )}
+          </Box>
+        )
+      }
       const toggle = () => {
         void update($, isContextOpen, v => !v)
         void $.store.set(STORE_CONTEXT_OPEN, !isOpenContext)
@@ -875,18 +944,8 @@ export const register: Register = (on, options) => {
                       )}
                     </Box>
                     {g.items.length ? (
-                      <Box flexDirection="row" flexWrap="wrap" columnGap={1} rowGap="xs">
-                        {g.items.map(item => {
-                          const isOn = !off.includes(item.id)
-                          return (
-                            <Button
-                              key={item.id}
-                              label={`${isOn ? '☑' : '☐'} ${item.label} · ~${kTokens(item.tokens)}`}
-                              dimColor={!isOn}
-                              onPress={() => void setContextOff($, target, [item.id], isOn)}
-                            />
-                          )
-                        })}
+                      <Box flexDirection="column">
+                        {byServer(g.items).map(([server, items]) => (server ? serverRow(server, items) : items.map(itemRow)))}
                       </Box>
                     ) : (
                       <Text size="caption" dimColor>
@@ -945,18 +1004,19 @@ export const register: Register = (on, options) => {
     const { Input, Select } = elements
 
     /**
-     * A small label beside its control, in a column of one width so every field lines up;
-     * a pane too narrow for both puts the control under its label. `below` sits centred
+     * A small label beside its control, right-aligned in a column of one width so every field
+     * lines up; the control starts from no width and grows, so a long Select stays on the
+     * label's row. A pane too narrow for both puts the control under its label. `below` sits centred
      * under the control, a little apart (a field's own action).
      */
     const field = (label: string, control: RenderElement, below?: RenderElement) => (
       <Box flexDirection="row" flexWrap="wrap" alignItems={below ? 'flex-start' : 'center'} columnGap={1}>
-        <Box width={LABEL_WIDTH} flexShrink={0}>
+        <Box width={LABEL_WIDTH} flexShrink={0} flexDirection="row" justifyContent="flex-end">
           <Text size="caption" dimColor>
             {label}
           </Text>
         </Box>
-        <Box flexDirection="column" flexGrow={1} flexShrink={1} minWidth={CONTROL_MIN_WIDTH}>
+        <Box flexDirection="column" flexGrow={1} flexShrink={1} width={0} minWidth={CONTROL_MIN_WIDTH}>
           {control}
           {below && (
             <Box flexDirection="row" justifyContent="center" marginTop="sm">

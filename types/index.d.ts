@@ -84,6 +84,8 @@ declare module 'claude-code' {
       contextSeen: ContextSeen
       /** Whether the pane's Context section is expanded. */
       isContextOpen: boolean
+      /** The MCP servers unfolded in the Context section, to switch their tools one by one. */
+      openServers: string[]
       draft: Draft
       /** The provider whose form is open in the pane: its id, `+new` for the add form, or none. */
       editing: string | null

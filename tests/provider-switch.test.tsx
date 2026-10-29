@@ -647,6 +647,19 @@ test('Claude has its own context settings: an off tool is deferred, an off remin
   expect((await $.prompt.attachment({ type: 'skill_listing', text: 'Skills: a, b, c', origin: { kind: 'engine' } } as never)).text).toBeNull()
   // A mentioned file is the conversation itself: never offered, never dropped.
   expect((await $.prompt.attachment({ type: 'file', text: 'contents', origin: { kind: 'engine' } } as never)).text).toBe('contents')
+
+  // An MCP server's tools fold into one row that switches them all.
+  const mcp = { plugin: 'engine', tier: 'mcp' }
+  await $.tool.describe({ tool: 'mcp__docs__read', description: 'Reads a doc.', provider: mcp } as never)
+  await $.tool.describe({ tool: 'mcp__docs__write', description: 'Writes a doc.', provider: mcp } as never)
+  expect((await ui.find({ key: 'server:docs' }))?.text).toMatch(/^☑ docs \(MCP, 2\/2 tools\)/)
+  expect(await ui.find({ key: 'tool:mcp__docs__read' })).toBeUndefined()
+  await ui.press({ key: 'server:docs' })
+  expect((await $.tool.describe({ tool: 'mcp__docs__write', description: 'Writes a doc.', provider: mcp } as never)).isDeferred).toBe(true)
+  await ui.press({ key: 'server-fold:docs' })
+  await ui.press({ key: 'tool:mcp__docs__read' })
+  expect((await ui.find({ key: 'tool:mcp__docs__read' }))?.text).toMatch(/^☑ read · ~\d+$/)
+  expect((await ui.find({ key: 'server:docs' }))?.text).toMatch(/^◐ docs \(MCP, 1\/2 tools\)/)
 })
 
 test('a provider not in use offers its models, and picking one switches to it', async ($, on) => {
