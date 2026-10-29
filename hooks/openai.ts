@@ -36,18 +36,27 @@ export type Reply = {
   model: string
 }
 
-/** `https://host` or `https://host/v1/` → `https://host/v1`. */
+/**
+ * The base the API paths hang off: a URL with a path is kept as given
+ * (`https://host/v1beta/openai`), a bare host gets `/v1` (`https://host` → `https://host/v1`).
+ */
 export function apiBase(url: string): string {
   const trimmed = url.trim().replace(/\/+$/, '')
-  return /\/v1$/.test(trimmed) ? trimmed : `${trimmed}/v1`
+  const path = trimmed.replace(/^[a-z]+:\/\/[^/]+/i, '')
+  return path ? trimmed : `${trimmed}/v1`
 }
 
-/** The ids of a `GET /v1/models` body, sorted; throws on a body of another shape. */
-export function parseModels(body: string): string[] {
-  const json = JSON.parse(body) as { data?: { id?: unknown }[] }
-  if (!Array.isArray(json.data)) throw new Error('the reply has no "data" list')
-  const ids = json.data.map(m => m.id).filter((id): id is string => typeof id === 'string')
-  return [...new Set(ids)].sort()
+/** The request headers for `key`: none when the provider takes no key. */
+export function authHeaders(key: string): Record<string, string> {
+  return key ? { authorization: `Bearer ${key}` } : {}
+}
+
+/** Model ids that name an embedding, speech, image or moderation model, not a chat one. */
+const NOT_CHAT = /(embed|whisper|tts|dall-e|gpt-image|moderation|transcribe|realtime|audio|davinci|babbage|rerank|sora|imagen|veo)/i
+
+/** Whether `id` can answer a chat completion, by its name and what its provider says it outputs. */
+export function isChatModel(id: string, info: ModelInfo | undefined): boolean {
+  return info?.text !== false && !NOT_CHAT.test(id)
 }
 
 function textOf(value: unknown): string {
@@ -71,46 +80,90 @@ function imageUrl(block: Block): string | undefined {
   return undefined
 }
 
-/** What the proxy says each model can do, as `GET /v1/model-capabilities` lists it. */
-export type Capabilities = Record<
-  string,
-  { contextWindow?: number; maxOutputTokens?: number; image?: boolean; tools?: boolean; reasoning?: boolean }
->
+/** What a provider says one model can do; a field it does not say stays absent. */
+export type ModelInfo = {
+  contextWindow?: number
+  maxOutputTokens?: number
+  image?: boolean
+  tools?: boolean
+  reasoning?: boolean
+  text?: boolean
+}
+
+export type Capabilities = Record<string, ModelInfo>
+
+type ModelEntry = {
+  id?: unknown
+  // IETI's /v1/model-capabilities
+  context_window?: unknown
+  max_output_tokens?: unknown
+  capabilities?: { text?: unknown; image?: unknown; tools?: unknown; reasoning?: unknown }
+  modalities?: { input?: unknown; output?: unknown }
+  // OpenRouter-style /models
+  context_length?: unknown
+  architecture?: { input_modalities?: unknown; output_modalities?: unknown }
+  top_provider?: { max_completion_tokens?: unknown }
+  supported_parameters?: unknown
+  // vLLM's /v1/models
+  max_model_len?: unknown
+}
+
+const numberOr = (v: unknown) => (typeof v === 'number' && v > 0 ? v : undefined)
+const boolOr = (v: unknown) => (typeof v === 'boolean' ? v : undefined)
+const listOr = (v: unknown) => (Array.isArray(v) ? (v as unknown[]) : undefined)
+
+/** What one model entry says, in any of the shapes above; unknown fields left out. */
+function infoOf(entry: ModelEntry): ModelInfo {
+  const inputs = listOr(entry.modalities?.input) ?? listOr(entry.architecture?.input_modalities)
+  const outputs = listOr(entry.modalities?.output) ?? listOr(entry.architecture?.output_modalities)
+  const params = listOr(entry.supported_parameters)
+  const info: ModelInfo = {
+    contextWindow: numberOr(entry.context_window) ?? numberOr(entry.context_length) ?? numberOr(entry.max_model_len),
+    maxOutputTokens: numberOr(entry.max_output_tokens) ?? numberOr(entry.top_provider?.max_completion_tokens),
+    image: boolOr(entry.capabilities?.image) ?? (inputs ? inputs.includes('image') : undefined),
+    tools: boolOr(entry.capabilities?.tools) ?? (params ? params.includes('tools') : undefined),
+    reasoning: boolOr(entry.capabilities?.reasoning) ?? (params ? params.includes('reasoning') : undefined),
+    text: boolOr(entry.capabilities?.text) ?? (outputs ? outputs.includes('text') : undefined),
+  }
+  // Leave unknown fields out rather than undefined, so state stays plain JSON.
+  return Object.fromEntries(Object.entries(info).filter(([, v]) => v !== undefined)) as ModelInfo
+}
+
+function entriesOf(body: string): ModelEntry[] {
+  const json = JSON.parse(body) as { data?: ModelEntry[] }
+  if (!Array.isArray(json.data)) throw new Error('the reply has no "data" list')
+  return json.data.filter(e => typeof e?.id === 'string')
+}
 
 /**
- * The capabilities of an IETI-style `/v1/model-capabilities` body, keyed by
+ * The model ids of a `GET /models` body, sorted, and whatever each entry says
+ * about the model (OpenRouter and vLLM add context sizes there); throws on another shape.
+ */
+export function parseModels(body: string): { ids: string[]; capabilities: Capabilities } {
+  const entries = entriesOf(body)
+  const capabilities: Capabilities = {}
+  for (const entry of entries) {
+    const info = infoOf(entry)
+    if (Object.keys(info).length) capabilities[entry.id as string] = info
+  }
+  return { ids: [...new Set(entries.map(e => e.id as string))].sort(), capabilities }
+}
+
+/**
+ * The capabilities of an IETI-style `/model-capabilities` body, keyed by
  * model id. Fields the body leaves out stay absent; throws on another shape.
  */
 export function parseCapabilities(body: string): Capabilities {
-  const json = JSON.parse(body) as {
-    data?: {
-      id?: unknown
-      context_window?: unknown
-      max_output_tokens?: unknown
-      capabilities?: { image?: unknown; tools?: unknown; reasoning?: unknown }
-      modalities?: { input?: unknown }
-    }[]
-  }
-  if (!Array.isArray(json.data)) throw new Error('the reply has no "data" list')
+  return Object.fromEntries(entriesOf(body).map(entry => [entry.id as string, infoOf(entry)]))
+}
 
-  const numberOr = (v: unknown) => (typeof v === 'number' && v > 0 ? v : undefined)
-  const boolOr = (v: unknown) => (typeof v === 'boolean' ? v : undefined)
-  const out: Capabilities = {}
-  for (const entry of json.data) {
-    if (typeof entry.id !== 'string') continue
-    const inputs = Array.isArray(entry.modalities?.input) ? (entry.modalities.input as unknown[]) : undefined
-    const image = boolOr(entry.capabilities?.image) ?? (inputs ? inputs.includes('image') : undefined)
-    const info = {
-      contextWindow: numberOr(entry.context_window),
-      maxOutputTokens: numberOr(entry.max_output_tokens),
-      image,
-      tools: boolOr(entry.capabilities?.tools),
-      reasoning: boolOr(entry.capabilities?.reasoning),
-    }
-    // Leave unknown fields out rather than undefined, so state stays plain JSON.
-    out[entry.id] = Object.fromEntries(Object.entries(info).filter(([, v]) => v !== undefined))
-  }
-  return out
+/** "128k", "128000" or "1m" as a token count; undefined for anything else. */
+export function parseTokens(text: string): number | undefined {
+  const match = /^\s*(\d+(?:\.\d+)?)\s*([km]?)\s*$/i.exec(text)
+  if (!match) return undefined
+  const scale = { '': 1, k: 1000, m: 1_000_000 }[match[2]!.toLowerCase() as '' | 'k' | 'm']
+  const n = Math.round(Number(match[1]) * scale)
+  return n > 0 ? n : undefined
 }
 
 /** A rough token count for a request body: about four characters a token. */

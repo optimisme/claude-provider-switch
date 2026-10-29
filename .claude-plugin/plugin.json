@@ -1,7 +1,7 @@
 {
   "name": "provider-switch",
-  "version": "0.1.0",
-  "description": "Switch Claude Code between Claude and an OpenAI-compatible proxy (e.g. IETI Agents Proxy) from a pane",
+  "version": "0.2.0",
+  "description": "Switch Claude Code between Claude and the models of OpenAI-compatible providers (IETI Agents Proxy, DeepSeek, OpenAI, OpenRouter, Ollama...) from a pane",
   "author": { "name": "optimisme" },
   "repository": "https://github.com/optimisme/claude-provider-switch",
   "types": "./types/index.d.ts",
@@ -9,13 +9,13 @@
     "proxyUrl": {
       "type": "string",
       "title": "Proxy URL",
-      "description": "Base URL of the OpenAI-compatible proxy, e.g. https://agents.example.com (\"/v1\" is added if missing). Can also be set from the pane.",
+      "description": "Base URL of one OpenAI-compatible provider, shown as Configured, e.g. https://agents.example.com (a URL with no path gets /v1). More providers can be added in the pane.",
       "default": ""
     },
     "apiKey": {
       "type": "string",
       "title": "Proxy API key",
-      "description": "API key for the proxy (ieti_sk_...). Kept in secure storage. A key typed in the pane takes precedence.",
+      "description": "API key for the Configured provider (optional). Kept in secure storage.",
       "sensitive": true,
       "default": ""
     }
