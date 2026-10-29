@@ -1,5 +1,5 @@
 import { atom, read, update } from 'claude-code'
-import type { EngineInterface, PluginOptions, Register } from 'claude-code'
+import type { EngineInterface, PluginOptions, Register, RenderElement } from 'claude-code'
 
 import type { Catalog, ContextUse, Draft, ModelInfo, Override, ProviderView, Selection } from '../types'
 import {
@@ -26,6 +26,7 @@ const catalogs = atom({ plugin: 'provider-switch', key: 'catalogs' } as const, {
 const overrides = atom({ plugin: 'provider-switch', key: 'overrides' } as const, {} as Record<string, Override>)
 const context = atom({ plugin: 'provider-switch', key: 'context' } as const, null as ContextUse | null)
 const draft = atom({ plugin: 'provider-switch', key: 'draft' } as const, { name: '', url: '', key: '' } as Draft)
+const editing = atom({ plugin: 'provider-switch', key: 'editing' } as const, null as string | null)
 
 // Kept across sessions in the plugin's store (plain JSON on this machine).
 // The provider set in the plugin's config keeps its key in Claude Code's secure storage.
@@ -33,6 +34,7 @@ const STORE_PROVIDERS = 'providers' // { id, name, url }[]
 const STORE_KEYS = 'keys' // { [providerId]: key }
 const STORE_OVERRIDES = 'overrides' // { [providerId/model]: Override }
 const STORE_SELECTION = 'selection'
+const STORE_LAST_MODELS = 'lastModels' // { [providerId]: model }, what picking the provider again selects
 // Before named providers: one URL and key typed in the pane.
 const LEGACY_URL = 'proxyUrl'
 const LEGACY_KEY = 'apiKey'
@@ -40,6 +42,11 @@ const LEGACY_KEY = 'apiKey'
 const CLAUDE = 'claude'
 const PROXY_PREFIX = 'proxy:'
 const CONFIG_ID = 'config'
+// `editing` while the add form is open; no slug can spell it.
+const NEW = '+new'
+const EMPTY_DRAFT: Draft = { name: '', url: '', key: '' }
+// Columns of the pane's form labels, so the fields line up.
+const LABEL_WIDTH = 15
 
 // Share of a model's context window at which the mod warns, once per model.
 const CONTEXT_WARN = 0.8
@@ -141,20 +148,25 @@ async function migrateLegacy($: EngineInterface) {
   }
 }
 
-/** The backend that answers, as the button above the prompt shows it. */
-async function statusText($: EngineInterface) {
+/** What the bar above the prompt shows: the provider's name and small labels for the model. */
+async function barView($: EngineInterface): Promise<{ name: string; labels: string[]; isNearFull: boolean }> {
   const sel = await read($, selection)
-  if (sel.provider !== 'proxy') return '⇄ Claude'
+  if (sel.provider !== 'proxy') return { name: 'Claude', labels: [], isNearFull: false }
 
   const name = (await read($, providers)).find(p => p.id === sel.providerId)?.name ?? sel.providerId
   const key = modelKey(sel.providerId, sel.model)
   const info = effectiveInfo((await read($, catalogs))[sel.providerId], (await read($, overrides))[key], sel.model)
   const used = await read($, context)
-  const share =
-    info.contextWindow && used && used.model === key
-      ? ` · ${Math.round((used.inputTokens / info.contextWindow) * 100)}% ctx`
-      : ''
-  return `⇄ ${sel.model} (${name})${share}`
+  const labels = [sel.model]
+  if (info.image) labels.push('vision')
+  if (info.tools) labels.push('tools')
+  if (info.reasoning) labels.push('reasoning')
+  const window = info.contextWindow
+  const isUsed = Boolean(window && used && used.model === key)
+  if (window) {
+    labels.push(isUsed ? `${Math.round((used!.inputTokens / window) * 100)}% of ${kTokens(window)}` : `${kTokens(window)} ctx`)
+  }
+  return { name, labels, isNearFull: isUsed && used!.inputTokens >= window! * CONTEXT_WARN }
 }
 
 async function choose($: EngineInterface, value: string) {
@@ -162,8 +174,35 @@ async function choose($: EngineInterface, value: string) {
   await update($, selection, () => next)
   await $.store.set(STORE_SELECTION, next)
   if (next.provider === 'claude') return $.ui.toast('Model requests now go to Claude')
+  const last = ((await $.store.get(STORE_LAST_MODELS)) as Record<string, string> | undefined) ?? {}
+  await $.store.set(STORE_LAST_MODELS, { ...last, [next.providerId]: next.model })
   const name = (await read($, providers)).find(p => p.id === next.providerId)?.name ?? next.providerId
   $.ui.toast(`Model requests now go to ${next.model} via ${name}`)
+}
+
+/** Select a provider: the model last used with it, else its first. */
+async function pickProvider($: EngineInterface, id: string) {
+  if (id === CLAUDE) return choose($, CLAUDE)
+  const sel = await read($, selection)
+  if (sel.provider === 'proxy' && sel.providerId === id) return
+  const cat = (await read($, catalogs))[id]
+  const name = (await read($, providers)).find(p => p.id === id)?.name ?? id
+  if (!cat?.models.length) return $.ui.toast(`${name} lists no chat models${cat?.error ? ': fix it with Edit' : ' yet'}`)
+  const last = ((await $.store.get(STORE_LAST_MODELS)) as Record<string, string> | undefined)?.[id]
+  await choose($, `${PROXY_PREFIX}${id}/${last && cat.models.includes(last) ? last : cat.models[0]}`)
+}
+
+/** Open the form of a provider (or the add form, `NEW`), or close it when it is open. */
+async function toggleForm($: EngineInterface, id: string) {
+  const open = await read($, editing)
+  if (open === id) {
+    await update($, editing, () => null)
+    await update($, draft, () => EMPTY_DRAFT)
+    return
+  }
+  const p = (await read($, providers)).find(x => x.id === id)
+  await update($, draft, () => (p ? { name: p.name, url: p.url, key: '' } : EMPTY_DRAFT))
+  await update($, editing, () => id)
 }
 
 /** Record how full the context is and warn once when it nears the window. */
@@ -243,18 +282,27 @@ async function setDraft($: EngineInterface, field: keyof Draft, value: string) {
   await update($, draft, d => ({ ...d, [field]: value }))
 }
 
-/** Add the provider in the form, or replace the one with the same name; an empty key keeps the old one. */
+/** Save the open form: a new provider, or the one being edited; an empty key keeps the old one. */
 async function saveDraft($: EngineInterface) {
   const d = await read($, draft)
   const name = d.name.trim()
   const url = d.url.trim()
   if (!name || !url) return $.ui.toast('A provider needs a name and a URL')
 
-  const id = slug(name)
-  const list = (await storedProviders($)).filter(p => p.id !== id)
-  await $.store.set(STORE_PROVIDERS, [...list, { id, name, url }])
+  const stored = await storedProviders($)
+  const open = await read($, editing)
+  let id = open && open !== NEW ? open : slug(name)
+  if (open === NEW || !open) {
+    // A new provider never replaces one: `deepseek`, `deepseek-2`, …
+    const base = id
+    for (let n = 2; stored.some(p => p.id === id); n++) id = `${base}-${n}`
+  }
+  const at = stored.findIndex(p => p.id === id)
+  const list = at < 0 ? [...stored, { id, name, url }] : stored.map(p => (p.id === id ? { id, name, url } : p))
+  await $.store.set(STORE_PROVIDERS, list)
   if (d.key.trim()) await $.store.set(STORE_KEYS, { ...(await storedKeys($)), [id]: d.key.trim() })
-  await update($, draft, () => ({ name: '', url: '', key: '' }))
+  await update($, draft, () => EMPTY_DRAFT)
+  await update($, editing, () => null)
 
   const added = (await syncProviders($)).find(p => p.id === id)
   if (added) await reloadProvider($, added)
@@ -266,6 +314,7 @@ async function removeProvider($: EngineInterface, id: string) {
   await $.store.set(STORE_PROVIDERS, (await storedProviders($)).filter(p => p.id !== id))
   const { [id]: _, ...keys } = await storedKeys($)
   await $.store.set(STORE_KEYS, keys)
+  if ((await read($, editing)) === id) await update($, editing, () => null)
   await syncProviders($)
   await update($, catalogs, ({ [id]: __, ...rest }) => rest)
   await checkSelection($)
@@ -345,7 +394,7 @@ export const register: Register = (on, options) => {
     // The model lists are refreshed at every start; a failed fetch shows in the pane,
     // and one cut short by the session ending has no one left to tell.
     reloadAll($).catch(() => {})
-    void $.ui.open({ id: PANE, title: 'Model provider' })
+    void $.ui.open({ id: PANE, title: 'Provider Switch' })
 
     return next(e)
   })
@@ -353,7 +402,7 @@ export const register: Register = (on, options) => {
   on('command.run', { command: COMMAND }, async ($, e) => {
     const arg = e.args.trim()
     if (!arg) {
-      await $.ui.open({ id: PANE, title: 'Model provider', focus: true })
+      await $.ui.open({ id: PANE, title: 'Provider Switch', focus: true })
       return { text: 'Model provider pane opened.' }
     }
 
@@ -501,14 +550,30 @@ export const register: Register = (on, options) => {
   on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
     if (e.props.hasSurvey) return next(e)
 
-    const { Box, Button } = $.ui.resolve(e)
-    const text = await statusText($)
+    const { Box, Text, Button } = $.ui.resolve(e)
+    const bar = await barView($)
     return (
-      <Box>
+      <Box flexDirection="row" justifyContent="space-between" alignItems="center" columnGap={1}>
+        <Box flexDirection="row" flexWrap="wrap" alignItems="center" columnGap={1} flexShrink={1}>
+          <Text>
+            Provider Switch: <Text bold>{bar.name}</Text>
+          </Text>
+          {bar.labels.map((label, i) => (
+            <Text
+              size="caption"
+              color={bar.isNearFull && i === bar.labels.length - 1 ? 'warning' : 'suggestion'}
+              dimColor={i > 0 && !(bar.isNearFull && i === bar.labels.length - 1)}
+            >
+              {` ${label} `}
+            </Text>
+          ))}
+        </Box>
         <Button
           key="open-pane"
-          label={text}
-          onPress={() => void $.ui.open({ id: PANE, title: 'Model provider', focus: true })}
+          label="⚙"
+          plain
+          dimColor
+          onPress={() => void $.ui.open({ id: PANE, title: 'Provider Switch', focus: true })}
         />
       </Box>
     )
@@ -523,24 +588,7 @@ export const register: Register = (on, options) => {
     const set = await read($, overrides)
     const used = await read($, context)
     const d = await read($, draft)
-
-    const choices = [
-      { value: CLAUDE, label: 'Claude Code (Anthropic)' },
-      ...list.flatMap(p =>
-        (all[p.id]?.models ?? []).map(model => {
-          const window = effectiveInfo(all[p.id], set[modelKey(p.id, model)], model).contextWindow
-          return {
-            value: `${PROXY_PREFIX}${p.id}/${model}`,
-            label: `${model} · ${p.name}${window ? ` · ${kTokens(window)}` : ''}`,
-          }
-        }),
-      ),
-    ]
-    const current = sel.provider === 'proxy' ? `${PROXY_PREFIX}${sel.providerId}/${sel.model}` : CLAUDE
-    const isLoading = list.some(p => all[p.id]?.isLoading)
-    const reload = (
-      <Button key="reload" label={isLoading ? 'Reloading…' : 'Reload all'} onPress={() => void reloadAll($)} />
-    )
+    const open = await read($, editing)
 
     const selKey = sel.provider === 'proxy' ? modelKey(sel.providerId, sel.model) : ''
     const selName = sel.provider === 'proxy' ? (list.find(p => p.id === sel.providerId)?.name ?? sel.providerId) : ''
@@ -552,124 +600,250 @@ export const register: Register = (on, options) => {
         ? `Context: ${kTokens(used.inputTokens)}${window ? ` of ${kTokens(window)} (${Math.round((used.inputTokens / window) * 100)}%)` : ''} at the last answer`
         : undefined
     const isNearFull = Boolean(window && used && used.model === selKey && used.inputTokens >= window * CONTEXT_WARN)
+    const isLoading = list.some(p => all[p.id]?.isLoading)
 
-    const header = (
+    const summary = (
       <Box flexDirection="column">
         <Text bold>{sel.provider === 'proxy' ? `Using ${sel.model} via ${selName}` : 'Using Claude'}</Text>
         {sel.provider === 'proxy' && <Text dimColor>{describe(info)}</Text>}
-        {usedLine && <Text dimColor={!isNearFull}>{isNearFull ? `⚠ ${usedLine}` : usedLine}</Text>}
+        {usedLine && (
+          <Text color={isNearFull ? 'warning' : undefined} dimColor={!isNearFull}>
+            {isNearFull ? `⚠ ${usedLine}` : usedLine}
+          </Text>
+        )}
         {info.image === false && <Text dimColor>Images in the conversation are left out for this model.</Text>}
         {info.tools === false && <Text dimColor>This model gets no tools: it can only answer in text.</Text>}
       </Box>
     )
 
-    const providerRows = list.map(p => {
-      const cat = all[p.id]
-      const state = cat?.isLoading
-        ? 'loading…'
-        : cat?.error
-          ? `⚠ ${cat.error}`
-          : `${cat?.models.length ?? 0} chat model${cat?.models.length === 1 ? '' : 's'}`
-      const keyText = p.keyHint ? `key …${p.keyHint}` : 'no key'
-      return (
-        <Box key={`provider:${p.id}`} flexDirection="column">
-          <Text>
-            {p.name} <Text dimColor>· {p.url} · {keyText}{p.source === 'config' ? ' · from plugin config' : ''}</Text>
-          </Text>
-          <Text dimColor={!cat?.error}>{state}</Text>
-          {p.source === 'pane' && (
-            <Box flexDirection="row">
-              {p.keyHint && (
-                <Button key={`forget:${p.id}`} label="Forget key" dimColor onPress={() => void forgetKey($, p.id)} />
-              )}
-              <Button key={`remove:${p.id}`} label="Remove" dimColor onPress={() => void removeProvider($, p.id)} />
-            </Box>
-          )}
-        </Box>
-      )
-    })
+    /** One provider's status: `3 chat models`, `loading…` or its error. */
+    const stateOf = (id: string) => {
+      const cat = all[id]
+      if (cat?.isLoading) return 'loading…'
+      if (cat?.error) return `⚠ ${cat.error}`
+      const n = cat?.models.length ?? 0
+      return `${n} chat model${n === 1 ? '' : 's'}`
+    }
 
-    // Mobile draws no Input or Select: one button per model, and providers are set elsewhere.
+    // Mobile draws no Input or Select: one button per provider, then one per model of the selected one.
     if (!('Select' in elements) || !('Input' in elements)) {
+      const models = sel.provider === 'proxy' ? (all[sel.providerId]?.models ?? []) : []
       return (
-        <Box flexDirection="column">
-          {header}
-          {choices.map(choice => (
+        <Box flexDirection="column" gap="sm">
+          {summary}
+          <Button key={`pick:${CLAUDE}`} label={`${sel.provider === 'claude' ? '●' : '○'} Claude`} onPress={() => void pickProvider($, CLAUDE)} />
+          {list.map(p => (
             <Button
-              key={choice.value}
-              label={choice.value === current ? `● ${choice.label}` : choice.label}
-              onPress={() => void choose($, choice.value)}
+              key={`pick:${p.id}`}
+              label={`${sel.provider === 'proxy' && sel.providerId === p.id ? '●' : '○'} ${p.name} · ${stateOf(p.id)}`}
+              onPress={() => void pickProvider($, p.id)}
             />
           ))}
-          {reload}
+          {sel.provider === 'proxy' &&
+            models.map(model => (
+              <Button
+                key={`${PROXY_PREFIX}${sel.providerId}/${model}`}
+                label={model === sel.model ? `● ${model}` : `  ${model}`}
+                dimColor={model !== sel.model}
+                onPress={() => void choose($, `${PROXY_PREFIX}${sel.providerId}/${model}`)}
+              />
+            ))}
+          <Button key="reload" label={isLoading ? 'Reloading…' : 'Reload all'} onPress={() => void reloadAll($)} />
         </Box>
       )
     }
     const { Input, Select } = elements
-    const override = set[selKey]
 
-    return (
-      <Box flexDirection="column">
-        {header}
-        <Select key="model" label="Model" options={choices} value={current} onSelect={value => void choose($, value)} />
-        {sel.provider === 'proxy' && (
-          <Box flexDirection="column">
+    /** A label in a fixed column and its control beside it, so every field of a form lines up. */
+    const field = (label: string, control: RenderElement) => (
+      <Box flexDirection="row" alignItems="center" columnGap={1}>
+        <Box width={LABEL_WIDTH} flexShrink={0}>
+          <Text dimColor>{label}</Text>
+        </Box>
+        <Box flexGrow={1} flexShrink={1}>
+          {control}
+        </Box>
+      </Box>
+    )
+
+    /** The settings of the provider `id` (or a new one): name, URL, key and its actions. */
+    const form = (p: ProviderView | undefined) => {
+      const isConfig = p?.source === 'config'
+      return (
+        <Box flexDirection="column" rowGap="xs" marginTop="xs">
+          {isConfig ? (
+            <Box flexDirection="column" rowGap="xs">
+              {field('URL', <Text>{p!.url}</Text>)}
+              {field('API key', <Text dimColor>{p!.keyHint ? `…${p!.keyHint}` : 'none'}</Text>)}
+              <Text dimColor size="caption">
+                Set in the plugin's options; change it there.
+              </Text>
+            </Box>
+          ) : (
+            <Box flexDirection="column" rowGap="xs">
+              {field(
+                'Name',
+                <Input
+                  key="form-name"
+                  placeholder="e.g. DeepSeek"
+                  value={d.name}
+                  onInput={value => void setDraft($, 'name', value)}
+                  onSubmit={value => void setDraft($, 'name', value)}
+                />,
+              )}
+              {field(
+                'URL',
+                <Input
+                  key="form-url"
+                  placeholder="https://api.deepseek.com (no path → /v1)"
+                  value={d.url}
+                  onInput={value => void setDraft($, 'url', value)}
+                  onSubmit={value => void setDraft($, 'url', value)}
+                />,
+              )}
+              {field(
+                'API key',
+                <Input
+                  key="form-key"
+                  placeholder={p?.keyHint ? `…${p.keyHint} (empty keeps it)` : 'optional'}
+                  value={d.key}
+                  submitLabel="save"
+                  onInput={value => void setDraft($, 'key', value)}
+                  onSubmit={value => void submitKey($, value)}
+                />,
+              )}
+            </Box>
+          )}
+          <Box flexDirection="row" flexWrap="wrap" columnGap={1}>
+            {!isConfig && <Button key="save-provider" label={p ? 'Save' : 'Add provider'} variant="primary" onPress={() => void saveDraft($)} />}
+            {p && (
+              <Button
+                key={`reload:${p.id}`}
+                label={all[p.id]?.isLoading ? 'Reloading…' : 'Reload'}
+                onPress={() => void reloadOne($, p.id)}
+              />
+            )}
+            {p && !isConfig && p.keyHint && (
+              <Button key={`forget:${p.id}`} label="Forget key" onPress={() => void forgetKey($, p.id)} />
+            )}
+            {p && !isConfig && (
+              <Button key={`remove:${p.id}`} label="Remove" dimColor onPress={() => void removeProvider($, p.id)} />
+            )}
+          </Box>
+        </Box>
+      )
+    }
+
+    /** The selected provider's model and the person's overrides for it. */
+    const modelSettings = () => {
+      if (sel.provider !== 'proxy') return null
+      const models = all[sel.providerId]?.models ?? []
+      const options = (models.includes(sel.model) ? models : [sel.model, ...models]).map(model => {
+        const w = effectiveInfo(all[sel.providerId], set[modelKey(sel.providerId, model)], model).contextWindow
+        return { value: `${PROXY_PREFIX}${sel.providerId}/${model}`, label: w ? `${model} · ${kTokens(w)}` : model }
+      })
+      const override = set[selKey]
+      return (
+        <Box flexDirection="column" rowGap="xs" marginTop="xs">
+          {field(
+            'Model',
+            <Select
+              key="model"
+              options={options}
+              value={`${PROXY_PREFIX}${sel.providerId}/${sel.model}`}
+              onSelect={value => void choose($, value)}
+            />,
+          )}
+          {field(
+            'Vision',
             <Select
               key="vision"
-              label="Vision"
               options={[
-                {
-                  value: 'auto',
-                  label: `as reported (${reported.image === undefined ? 'unknown' : reported.image ? 'yes' : 'no'})`,
-                },
+                { value: 'auto', label: `as reported (${reported.image === undefined ? 'unknown' : reported.image ? 'yes' : 'no'})` },
                 { value: 'yes', label: 'yes' },
                 { value: 'no', label: 'no' },
               ]}
               value={override?.image === undefined ? 'auto' : override.image ? 'yes' : 'no'}
               onSelect={value => void setVision($, selKey, value)}
-            />
+            />,
+          )}
+          {field(
+            'Context window',
             <Input
               key="context"
-              label="Context window"
               placeholder={`as reported (${reported.contextWindow ? kTokens(reported.contextWindow) : 'unknown'}), e.g. 128k`}
               value={override?.contextWindow ? kTokens(override.contextWindow) : ''}
               submitLabel="save"
               onSubmit={value => void setContextWindow($, selKey, value)}
+            />,
+          )}
+        </Box>
+      )
+    }
+
+    /** One selectable provider: a radio, its name and state, an Edit toggle; expanded below when open. */
+    const row = (id: string, name: string, detail: string, p?: ProviderView) => {
+      const isSelected = id === CLAUDE ? sel.provider === 'claude' : sel.provider === 'proxy' && sel.providerId === id
+      const isError = Boolean(all[id]?.error)
+      return (
+        <Box
+          key={`row:${id}`}
+          flexDirection="column"
+          borderStyle="round"
+          borderColor={isSelected ? 'claude' : undefined}
+          borderDimColor={!isSelected}
+          paddingX={1}
+        >
+          <Box flexDirection="row" justifyContent="space-between" alignItems="center" columnGap={1}>
+            <Box flexShrink={1}>
+              <Button key={`pick:${id}`} plain onPress={() => void pickProvider($, id)}>
+                <Text color={isSelected ? 'claude' : undefined}>{isSelected ? '●' : '○'}</Text> <Text bold>{name}</Text>
+              </Button>
+            </Box>
+            {p && <Button key={`edit:${id}`} label={open === id ? 'Close' : 'Edit'} dimColor={open !== id} onPress={() => void toggleForm($, id)} />}
+          </Box>
+          <Text size="caption" dimColor={!isError} color={isError ? 'error' : undefined} wrap="truncate-end">
+            {detail}
+          </Text>
+          {isSelected && modelSettings()}
+          {p && open === id && form(p)}
+        </Box>
+      )
+    }
+
+    return (
+      <Box flexDirection="column" rowGap="sm">
+        <Box flexDirection="row" justifyContent="space-between" alignItems="center">
+          <Text size="heading" bold>
+            Providers
+          </Text>
+          <Box flexDirection="row" columnGap={1}>
+            <Button key="reload" label={isLoading ? 'Reloading…' : 'Reload all'} dimColor onPress={() => void reloadAll($)} />
+            <Button
+              key="add"
+              label={open === NEW ? 'Cancel' : '+ Add'}
+              variant={open === NEW ? undefined : 'primary'}
+              onPress={() => void toggleForm($, NEW)}
             />
           </Box>
+        </Box>
+        {open === NEW && (
+          <Box key="row:new" flexDirection="column" borderStyle="round" borderColor="suggestion" paddingX={1}>
+            <Text bold>New provider</Text>
+            {form(undefined)}
+          </Box>
         )}
-        <Text> </Text>
-        <Text bold>Providers</Text>
-        {providerRows.length ? providerRows : <Text dimColor>None yet: add one below.</Text>}
-        {reload}
-        <Text> </Text>
-        <Text bold>Add or update a provider</Text>
-        <Input
-          key="new-name"
-          label="Name"
-          placeholder="e.g. DeepSeek (same name replaces)"
-          value={d.name}
-          onInput={value => void setDraft($, 'name', value)}
-          onSubmit={value => void setDraft($, 'name', value)}
-        />
-        <Input
-          key="new-url"
-          label="URL"
-          placeholder="https://api.deepseek.com (no path → /v1 is added)"
-          value={d.url}
-          onInput={value => void setDraft($, 'url', value)}
-          onSubmit={value => void setDraft($, 'url', value)}
-        />
-        <Input
-          key="new-key"
-          label="API key"
-          placeholder="optional; empty keeps the saved key"
-          value={d.key}
-          submitLabel="save"
-          onInput={value => void setDraft($, 'key', value)}
-          onSubmit={value => void submitKey($, value)}
-        />
-        <Button key="save-provider" label="Save provider" onPress={() => void saveDraft($)} />
+        {summary}
+        {row(CLAUDE, 'Claude', 'Claude Code (Anthropic)')}
+        {list.map(p =>
+          row(
+            p.id,
+            p.name,
+            `${stateOf(p.id)} · ${p.url} · ${p.keyHint ? `key …${p.keyHint}` : 'no key'}${p.source === 'config' ? ' · plugin config' : ''}`,
+            p,
+          ),
+        )}
+        {!list.length && open !== NEW && <Text dimColor>No providers yet: press + Add.</Text>}
       </Box>
     )
   })
@@ -679,4 +853,11 @@ export const register: Register = (on, options) => {
 async function submitKey($: EngineInterface, value: string) {
   await setDraft($, 'key', value)
   await saveDraft($)
+}
+
+/** Reload one provider's models, then leave a model it no longer lists. */
+async function reloadOne($: EngineInterface, id: string) {
+  const p = (await syncProviders($)).find(x => x.id === id)
+  if (p) await reloadProvider($, p)
+  await checkSelection($)
 }

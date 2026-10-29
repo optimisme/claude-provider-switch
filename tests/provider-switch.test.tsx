@@ -208,9 +208,16 @@ test('picking a configured model sends the next step to it', { options: OPTIONS 
 
   const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
   await ui.press({ key: 'reload' })
-  expect((await ui.find({ type: 'Text', text: /chat models/ }))?.text).toBe('2 chat models')
+  expect((await ui.find({ type: 'Text', text: /chat models/ }))?.text).toBe(
+    '2 chat models · https://proxy.test · key …test · plugin config',
+  )
   expect(requests[0]).toEqual({ url: 'https://proxy.test/v1/models', body: undefined, auth: 'Bearer ieti_sk_test' })
 
+  // Picking the provider selects its first model; the model list then shows under it.
+  await ui.press({ key: 'pick:config' })
+  expect((await ui.find({ type: 'Text', text: /^Using / }))?.text).toBe('Using deepseek-chat via Configured')
+  await ui.select({ key: 'model', value: 'proxy:config/qwen' })
+  expect((await ui.find({ type: 'Text', text: /^Using / }))?.text).toBe('Using qwen via Configured')
   await ui.select({ key: 'model', value: 'proxy:config/deepseek-chat' })
   expect((await ui.find({ type: 'Text', text: /^Using / }))?.text).toBe('Using deepseek-chat via Configured')
   await ui.unmount()
@@ -271,20 +278,23 @@ test('named providers: several at once, an empty key, a URL path kept, non-chat 
   await start($)
 
   const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
-  expect(await ui.find({ type: 'Text', text: /None yet/ })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /No providers yet/ })).toBeDefined()
 
-  // Typing fills the form; the button saves it.
-  await ui.input({ key: 'new-name', text: 'DeepSeek', kind: 'change' })
-  await ui.input({ key: 'new-url', text: 'https://api.deepseek.test', kind: 'change' })
-  await ui.input({ key: 'new-key', text: 'sk-deep', kind: 'change' })
+  // + Add opens an empty form; typing fills it and the button saves it.
+  await ui.press({ key: 'add' })
+  await ui.input({ key: 'form-name', text: 'DeepSeek', kind: 'change' })
+  await ui.input({ key: 'form-url', text: 'https://api.deepseek.test', kind: 'change' })
+  await ui.input({ key: 'form-key', text: 'sk-deep', kind: 'change' })
   await ui.press({ key: 'save-provider' })
+  expect(await ui.find({ key: 'form-name' })).toBeUndefined()
   // Enter in the key field saves too; this one has no key.
-  await ui.input({ key: 'new-name', text: 'Gemini', kind: 'change' })
-  await ui.input({ key: 'new-url', text: 'https://gen.test/v1beta/openai', kind: 'change' })
-  await ui.input({ key: 'new-key', text: '' })
+  await ui.press({ key: 'add' })
+  await ui.input({ key: 'form-name', text: 'Gemini', kind: 'change' })
+  await ui.input({ key: 'form-url', text: 'https://gen.test/v1beta/openai', kind: 'change' })
+  await ui.input({ key: 'form-key', text: '' })
 
-  expect((await ui.find({ type: 'Text', text: /^1 chat model/ }))?.text).toBe('1 chat model')
-  await ui.select({ key: 'model', value: 'proxy:gemini/gemini-x' })
+  expect((await ui.find({ type: 'Text', text: /^1 chat model/ }))?.text).toMatch(/^1 chat model · /)
+  await ui.press({ key: 'pick:gemini' })
   expect((await ui.find({ type: 'Text', text: /^Using / }))?.text).toBe('Using gemini-x via Gemini')
   await ui.unmount()
 
@@ -299,6 +309,7 @@ test('named providers: several at once, an empty key, a URL path kept, non-chat 
 
   // Removing the selected provider goes back to Claude.
   const again = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  await again.press({ key: 'edit:gemini' })
   await again.press({ key: 'remove:gemini' })
   expect((await again.find({ type: 'Text', text: /^Using / }))?.text).toBe('Using Claude')
   await again.unmount()
@@ -454,13 +465,50 @@ test('the button above the prompt names the backend and opens the pane', { optio
     surface: 'desktop',
     props: { hasSurvey: false, isWorking: false, maxRows: 10, bodyColumns: 60, scroll: { offset: 0, bodyRows: 10 }, view: {} },
   } as never)
-  expect((await band.find({ key: 'open-pane' }))?.props.label).toBe('⇄ Claude')
+  expect((await band.find({ type: 'Text', text: /^Provider Switch/ }))?.text).toBe('Provider Switch: Claude')
 
   opened.length = 0
   await band.press({ key: 'open-pane' })
   expect(opened).toEqual([expect.objectContaining({ id: 'provider-switch', focus: true })])
 
   await $.command.run({ command: 'provider', args: 'config/deepseek-chat' } as never)
-  expect((await band.find({ key: 'open-pane' }))?.props.label).toBe('⇄ deepseek-chat (Configured)')
+  expect((await band.find({ type: 'Text', text: /^Provider Switch/ }))?.text).toBe('Provider Switch: Configured')
+  expect(await band.find({ type: 'Text', text: ' deepseek-chat ' })).toBeDefined()
   await band.unmount()
+})
+
+test('Edit opens a provider form: renaming keeps its id and selection, + Add never replaces', async ($, on) => {
+  world(
+    on,
+    { routes: { 'https://ds.test/v1/models': { json: { data: [{ id: 'deepseek-chat' }] } } } },
+    { providers: [{ id: 'deepseek', name: 'DeepSeek', url: 'https://ds.test/v1' }], keys: { deepseek: 'sk-1234' } },
+  )
+  await start($)
+  await $.command.run(provider('deepseek-chat'))
+
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  await ui.press({ key: 'edit:deepseek' })
+  expect((await ui.find({ key: 'form-name' }))?.props.value).toBe('DeepSeek')
+  expect((await ui.find({ key: 'form-url' }))?.props.value).toBe('https://ds.test/v1')
+  await ui.input({ key: 'form-name', text: 'DeepSeek Work', kind: 'change' })
+  await ui.press({ key: 'save-provider' })
+  expect((await ui.find({ type: 'Text', text: /^Using / }))?.text).toBe('Using deepseek-chat via DeepSeek Work')
+
+  // The same name again is a second provider, not a replacement.
+  await ui.press({ key: 'add' })
+  await ui.input({ key: 'form-name', text: 'DeepSeek', kind: 'change' })
+  await ui.input({ key: 'form-url', text: 'https://ds.test/v1', kind: 'change' })
+  await ui.press({ key: 'save-provider' })
+  expect(await ui.find({ key: 'edit:deepseek-2' })).toBeDefined()
+  expect(await ui.find({ key: 'edit:deepseek' })).toBeDefined()
+
+  await ui.press({ key: 'edit:deepseek' })
+  await ui.press({ key: 'forget:deepseek' })
+  expect(await ui.find({ key: 'forget:deepseek' })).toBeUndefined()
+  await ui.press({ key: 'edit:deepseek' })
+  expect(await ui.find({ key: 'form-name' })).toBeUndefined()
+  await ui.unmount()
+
+  const listing = (await $.command.run(provider('reload'))).text
+  expect(listing).toBe('DeepSeek Work (deepseek): deepseek-chat\nDeepSeek (deepseek-2): deepseek-chat')
 })
