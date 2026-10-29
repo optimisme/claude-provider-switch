@@ -67,6 +67,8 @@ declare module 'claude-code' {
       draft: Draft
       /** The provider whose form is open in the pane: its id, `+new` for the add form, or none. */
       editing: string | null
+      /** The provider whose Remove waits for a confirmation, or none. */
+      removing: string | null
     }
   }
 }

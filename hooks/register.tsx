@@ -27,6 +27,7 @@ const overrides = atom({ plugin: 'provider-switch', key: 'overrides' } as const,
 const context = atom({ plugin: 'provider-switch', key: 'context' } as const, null as ContextUse | null)
 const draft = atom({ plugin: 'provider-switch', key: 'draft' } as const, { name: '', url: '', key: '' } as Draft)
 const editing = atom({ plugin: 'provider-switch', key: 'editing' } as const, null as string | null)
+const removing = atom({ plugin: 'provider-switch', key: 'removing' } as const, null as string | null)
 
 // Kept across sessions in the plugin's store (plain JSON on this machine).
 // The provider set in the plugin's config keeps its key in Claude Code's secure storage.
@@ -45,10 +46,6 @@ const CONFIG_ID = 'config'
 // `editing` while the add form is open; no slug can spell it.
 const NEW = '+new'
 const EMPTY_DRAFT: Draft = { name: '', url: '', key: '' }
-// Columns of the pane's form labels, so the fields line up.
-const LABEL_WIDTH = 15
-// Narrowest a field's control gets beside its label; below this it wraps under the label.
-const FIELD_MIN_WIDTH = 16
 
 // Share of a model's context window at which the mod warns, once per model.
 const CONTEXT_WARN = 0.8
@@ -197,6 +194,7 @@ async function pickProvider($: EngineInterface, id: string) {
 /** Open the form of a provider (or the add form, `NEW`), or close it when it is open. */
 async function toggleForm($: EngineInterface, id: string) {
   const open = await read($, editing)
+  await update($, removing, () => null)
   if (open === id) {
     await update($, editing, () => null)
     await update($, draft, () => EMPTY_DRAFT)
@@ -312,7 +310,13 @@ async function saveDraft($: EngineInterface) {
   $.ui.toast(`Saved provider ${name}`)
 }
 
+/** Ask before removing `id`, or stop asking (`null`). */
+async function askRemove($: EngineInterface, id: string | null) {
+  await update($, removing, () => id)
+}
+
 async function removeProvider($: EngineInterface, id: string) {
+  await update($, removing, () => null)
   await $.store.set(STORE_PROVIDERS, (await storedProviders($)).filter(p => p.id !== id))
   const { [id]: _, ...keys } = await storedKeys($)
   await $.store.set(STORE_KEYS, keys)
@@ -591,6 +595,7 @@ export const register: Register = (on, options) => {
     const used = await read($, context)
     const d = await read($, draft)
     const open = await read($, editing)
+    const confirming = await read($, removing)
 
     const selKey = sel.provider === 'proxy' ? modelKey(sel.providerId, sel.model) : ''
     const selName = sel.provider === 'proxy' ? (list.find(p => p.id === sel.providerId)?.name ?? sel.providerId) : ''
@@ -656,14 +661,20 @@ export const register: Register = (on, options) => {
     }
     const { Input, Select } = elements
 
-    /** A label in a fixed column and its control beside it, so every field of a form lines up. */
-    const field = (label: string, control: RenderElement) => (
-      <Box flexDirection="row" flexWrap="wrap" alignItems="center" columnGap={1}>
-        <Box width={LABEL_WIDTH} flexShrink={0}>
-          <Text dimColor>{label}</Text>
-        </Box>
-        <Box flexGrow={1} flexShrink={1} minWidth={FIELD_MIN_WIDTH}>
-          {control}
+    /**
+     * A small label over its control, the control the form's full width, so every field
+     * lines up at any pane width; `aside` sits at the control's right (a field's own action).
+     */
+    const field = (label: string, control: RenderElement, aside?: RenderElement) => (
+      <Box flexDirection="column">
+        <Text size="caption" dimColor>
+          {label}
+        </Text>
+        <Box flexDirection="row" alignItems="center" columnGap={1}>
+          <Box flexGrow={1} flexShrink={1} minWidth={0}>
+            {control}
+          </Box>
+          {aside}
         </Box>
       </Box>
     )
@@ -713,25 +724,39 @@ export const register: Register = (on, options) => {
                   onInput={value => void setDraft($, 'key', value)}
                   onSubmit={value => void submitKey($, value)}
                 />,
+                p?.keyHint ? (
+                  <Button key={`forget:${p.id}`} label="Forget" dimColor onPress={() => void forgetKey($, p.id)} />
+                ) : undefined,
               )}
             </Box>
           )}
-          <Box flexDirection="row" flexWrap="wrap" columnGap={1}>
-            {!isConfig && <Button key="save-provider" label={p ? 'Save' : 'Add provider'} variant="primary" onPress={() => void saveDraft($)} />}
-            {p && (
-              <Button
-                key={`reload:${p.id}`}
-                label={all[p.id]?.isLoading ? 'Reloading…' : 'Reload'}
-                onPress={() => void reloadOne($, p.id)}
-              />
-            )}
-            {p && !isConfig && p.keyHint && (
-              <Button key={`forget:${p.id}`} label="Forget key" onPress={() => void forgetKey($, p.id)} />
-            )}
-            {p && !isConfig && (
-              <Button key={`remove:${p.id}`} label="Remove" dimColor onPress={() => void removeProvider($, p.id)} />
-            )}
-          </Box>
+          {p && !isConfig && confirming === p.id ? (
+            <Box flexDirection="column" rowGap="xs" marginTop="xs">
+              <Text color="warning">Remove {p.name} and its key? This can't be undone.</Text>
+              <Box flexDirection="row" flexWrap="wrap" columnGap={1}>
+                <Button key={`remove-confirm:${p.id}`} label="Remove" variant="primary" onPress={() => void removeProvider($, p.id)} />
+                <Button key={`remove-cancel:${p.id}`} label="Cancel" onPress={() => void askRemove($, null)} />
+              </Box>
+            </Box>
+          ) : (
+            <Box flexDirection="row" flexWrap="wrap" justifyContent="space-between" alignItems="center" columnGap={1} marginTop="xs">
+              <Box flexDirection="row" flexWrap="wrap" columnGap={1}>
+                {!isConfig && (
+                  <Button key="save-provider" label={p ? 'Save' : 'Add provider'} variant="primary" onPress={() => void saveDraft($)} />
+                )}
+                {p && (
+                  <Button
+                    key={`reload:${p.id}`}
+                    label={all[p.id]?.isLoading ? 'Reloading…' : 'Reload'}
+                    onPress={() => void reloadOne($, p.id)}
+                  />
+                )}
+              </Box>
+              {p && !isConfig && (
+                <Button key={`remove:${p.id}`} label="Remove…" plain dimColor onPress={() => void askRemove($, p.id)} />
+              )}
+            </Box>
+          )}
         </Box>
       )
     }

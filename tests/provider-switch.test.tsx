@@ -311,6 +311,12 @@ test('named providers: several at once, an empty key, a URL path kept, non-chat 
   const again = await $.ui.mount({ ...PANE, surface: 'desktop' })
   await again.press({ key: 'edit:gemini' })
   await again.press({ key: 'remove:gemini' })
+  // Remove asks first; Cancel keeps the provider.
+  await again.press({ key: 'remove-cancel:gemini' })
+  expect(await again.find({ key: 'remove-confirm:gemini' })).toBeUndefined()
+  await again.press({ key: 'remove:gemini' })
+  expect((await again.find({ type: 'Text', text: /^Using / }))?.text).toBe('Using gemini-x via Gemini')
+  await again.press({ key: 'remove-confirm:gemini' })
   expect((await again.find({ type: 'Text', text: /^Using / }))?.text).toBe('Using Claude')
   await again.unmount()
 })
