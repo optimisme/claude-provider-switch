@@ -71,6 +71,10 @@ const REASONINGS_KEPT = 500
 const staleIds = new Set<string>()
 // Below this, a context window being typed is taken as not finished yet (`12` on the way to `128k`).
 const MIN_CONTEXT = 1000
+// The pane's label column, wide enough for "Context window", and the least a control
+// beside it gets before it moves under its label.
+const LABEL_WIDTH = 15
+const CONTROL_MIN_WIDTH = 20
 
 /** `90000` → `90k`. */
 function kTokens(n: number): string {
@@ -807,16 +811,25 @@ export const register: Register = (on, options) => {
     const { Input, Select } = elements
 
     /**
-     * A small label over its control, the control the form's full width, so every field
-     * lines up at any pane width; `below` sits right under the control (a field's own action).
+     * A small label beside its control, in a column of one width so every field lines up;
+     * a pane too narrow for both puts the control under its label. `below` sits centred
+     * under the control, a little apart (a field's own action).
      */
     const field = (label: string, control: RenderElement, below?: RenderElement) => (
-      <Box flexDirection="column">
-        <Text size="caption" dimColor>
-          {label}
-        </Text>
-        {control}
-        {below}
+      <Box flexDirection="row" flexWrap="wrap" alignItems={below ? 'flex-start' : 'center'} columnGap={1}>
+        <Box width={LABEL_WIDTH} flexShrink={0}>
+          <Text size="caption" dimColor>
+            {label}
+          </Text>
+        </Box>
+        <Box flexDirection="column" flexGrow={1} flexShrink={1} minWidth={CONTROL_MIN_WIDTH}>
+          {control}
+          {below && (
+            <Box flexDirection="row" justifyContent="center" marginTop="sm">
+              {below}
+            </Box>
+          )}
+        </Box>
       </Box>
     )
 
@@ -865,11 +878,13 @@ export const register: Register = (on, options) => {
                   onSubmit={value => void submitField($, 'key', value)}
                 />,
                 p?.keyHint ? (
-                  <Box flexDirection="row" alignItems="center" columnGap={1}>
+                  <Box flexDirection="row" flexWrap="wrap" justifyContent="center" alignItems="center" columnGap={1}>
                     <Text size="caption" dimColor>
                       Saved key …{p.keyHint}
                     </Text>
-                    <Button key={`forget:${p.id}`} label="Forget" plain onPress={() => void forgetKey($, p.id)} />
+                    <Button key={`forget:${p.id}`} variant="secondary" onPress={() => void forgetKey($, p.id)}>
+                      <Text size="caption">Forget</Text>
+                    </Button>
                   </Box>
                 ) : undefined,
               )}
