@@ -2,6 +2,8 @@
 // chat-completions form an OpenAI-compatible proxy speaks. Pure functions:
 // no `$`, so tests can call them directly.
 
+import type { ModelInfo } from '../types'
+
 /** A content block as `$.session.messages({ as: 'api' })` hands it over. */
 type Block = { type: string; [field: string]: unknown }
 export type AnthropicMessage = { role: 'user' | 'assistant'; content: readonly Block[] }
@@ -80,16 +82,6 @@ function imageUrl(block: Block): string | undefined {
   if (source?.type === 'base64' && source.data) return `data:${source.media_type ?? 'image/png'};base64,${source.data}`
   if (source?.type === 'url' && source.url) return source.url
   return undefined
-}
-
-/** What a provider says one model can do; a field it does not say stays absent. */
-export type ModelInfo = {
-  contextWindow?: number
-  maxOutputTokens?: number
-  image?: boolean
-  tools?: boolean
-  reasoning?: boolean
-  text?: boolean
 }
 
 export type Capabilities = Record<string, ModelInfo>

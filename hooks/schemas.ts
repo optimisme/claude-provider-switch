@@ -1,8 +1,7 @@
 // Input schemas for Claude Code's built-in tools, as a proxy model needs them
 // to call those tools. The mod API lists each tool's name and description but
 // not its schema, so the common ones are written out here; any other tool
-// (MCP, plugin, newer built-ins) gets an open object schema and relies on its
-// description.
+// (MCP, plugin, newer built-ins) is not offered.
 
 type Schema = Record<string, unknown>
 
@@ -85,9 +84,4 @@ export const KNOWN_SCHEMAS: Record<string, Schema> = {
     },
     ['description', 'prompt'],
   ),
-}
-
-/** The JSON schema to offer a proxy model for `tool`. */
-export function schemaFor(tool: string): Schema {
-  return KNOWN_SCHEMAS[tool] ?? { type: 'object', additionalProperties: true }
 }

@@ -178,7 +178,6 @@ async function setContextOff($: EngineInterface, target: string, ids: readonly s
   if (target === CLAUDE && ids.some(id => id.startsWith('tool:'))) $.ui.invalidate('tool.describe')
 }
 
-/** Record one item a request carried, keeping the pane's lists in step without needless redraws. */
 /**
  * Items in their order, each MCP server's tools (`mcp__<server>__<tool>`) gathered at the
  * place of its first one: `['', [item]]` for an item of its own, `[server, items]` for a server.
@@ -219,6 +218,7 @@ function leanOff(isClaude: boolean, tools: readonly ContextItem[], injected: rea
   ]
 }
 
+/** Record one item a request carried, keeping the pane's lists in step without needless redraws. */
 async function noteSeen($: EngineInterface, group: 'tools' | 'injected', item: ContextItem) {
   const seen = await read($, contextSeen)
   const before = seen[group].find(i => i.id === item.id)
