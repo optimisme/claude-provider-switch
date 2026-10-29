@@ -573,7 +573,18 @@ export const register: Register = (on, options) => {
     // The pane opens only when asked for: the ⚙ above the prompt or the command.
     reloadAll($).catch(() => {})
 
-    return next(e)
+    const result = await next(e)
+    // A surface may ask for the band before the session is ready and not again until
+    // the first turn: draw it now, so it is there before any message is sent.
+    $.ui.invalidate('ui.render')
+    return result
+  })
+
+  // A client attaching later (the desktop app's Code tab) gets the band drawn at once.
+  on('session.attach', async ($, e, next) => {
+    const result = await next(e)
+    $.ui.invalidate('ui.render')
+    return result
   })
 
   on('command.run', { command: COMMAND }, async ($, e) => {

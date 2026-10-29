@@ -471,9 +471,12 @@ test('a URL and key from before named providers become a provider named Proxy', 
 test('the button above the prompt names the backend and opens the pane', { options: OPTIONS }, async ($, on) => {
   const opened: unknown[] = []
   world(on, { routes: { 'https://proxy.test/v1/models': { json: { data: [{ id: 'deepseek-chat' }] } } }, opened })
+  const invalidated: string[] = []
+  on('ui.invalidate', ($, e, next) => (invalidated.push(e.event), next(e)))
   await start($)
-  // The pane waits to be asked for.
+  // The pane waits to be asked for; the band is drawn before any message is sent.
   expect(opened).toEqual([])
+  expect(invalidated).toContain('ui.render')
 
   const band = await $.ui.mount({
     plugin: 'provider-switch',
