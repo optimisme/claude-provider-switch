@@ -496,9 +496,13 @@ test('Edit opens a provider form: renaming keeps its id and selection, + Add nev
   await ui.press({ key: 'edit:deepseek' })
   expect((await ui.find({ key: 'form-name' }))?.props.value).toBe('DeepSeek')
   expect((await ui.find({ key: 'form-url' }))?.props.value).toBe('https://ds.test/v1')
+  // Typing saves: no Save button for an existing provider.
+  expect(await ui.find({ key: 'save-provider' })).toBeUndefined()
   await ui.input({ key: 'form-name', text: 'DeepSeek Work', kind: 'change' })
-  await ui.press({ key: 'save-provider' })
   expect((await ui.find({ type: 'Text', text: /^Using / }))?.text).toBe('Using deepseek-chat via DeepSeek Work')
+  await ui.input({ key: 'form-key', text: 'sk-new9', kind: 'change' })
+  expect(await ui.find({ type: 'Text', text: 'Saved key …new9' })).toBeDefined()
+  await ui.press({ key: 'edit:deepseek' })
 
   // The same name again is a second provider, not a replacement.
   await ui.press({ key: 'add' })

@@ -65,6 +65,10 @@ let warnedModel = ''
 const reasonings = new Map<string, string>()
 // The most tool calls whose reasoning is kept; older ones are dropped first.
 const REASONINGS_KEPT = 500
+// Providers whose URL or key changed in their open form: their models reload when it closes.
+const staleIds = new Set<string>()
+// Below this, a context window being typed is taken as not finished yet (`12` on the way to `128k`).
+const MIN_CONTEXT = 1000
 
 /** `90000` → `90k`. */
 function kTokens(n: number): string {
@@ -204,11 +208,13 @@ async function toggleForm($: EngineInterface, id: string) {
   if (open === id) {
     await update($, editing, () => null)
     await update($, draft, () => EMPTY_DRAFT)
-    return
+  } else {
+    const p = (await read($, providers)).find(x => x.id === id)
+    await update($, draft, () => (p ? { name: p.name, url: p.url, key: '' } : EMPTY_DRAFT))
+    await update($, editing, () => id)
   }
-  const p = (await read($, providers)).find(x => x.id === id)
-  await update($, draft, () => (p ? { name: p.name, url: p.url, key: '' } : EMPTY_DRAFT))
-  await update($, editing, () => id)
+  // The form it leaves was saved as typed; its models follow a new URL or key now.
+  if (open && staleIds.delete(open)) await reloadOne($, open)
 }
 
 /** Record how full the context is and warn once when it nears the window. */
@@ -288,6 +294,28 @@ async function setDraft($: EngineInterface, field: keyof Draft, value: string) {
   await update($, draft, d => ({ ...d, [field]: value }))
 }
 
+/**
+ * A field of an existing provider's form, as typed: kept at once, so the form needs no Save.
+ * A name or URL left empty keeps the last one; an empty key keeps the stored key.
+ */
+async function editField($: EngineInterface, field: keyof Draft, value: string) {
+  await setDraft($, field, value)
+  const id = await read($, editing)
+  if (!id || id === NEW) return
+  const stored = await storedProviders($)
+  const before = stored.find(p => p.id === id)
+  if (!before) return
+
+  const d = await read($, draft)
+  const name = d.name.trim() || before.name
+  const url = d.url.trim() || before.url
+  await $.store.set(STORE_PROVIDERS, stored.map(p => (p.id === id ? { id, name, url } : p)))
+  const key = field === 'key' ? value.trim() : ''
+  if (key) await $.store.set(STORE_KEYS, { ...(await storedKeys($)), [id]: key })
+  if (url !== before.url || key) staleIds.add(id)
+  await syncProviders($)
+}
+
 /** Save the open form: a new provider, or the one being edited; an empty key keeps the old one. */
 async function saveDraft($: EngineInterface) {
   const d = await read($, draft)
@@ -335,6 +363,8 @@ async function removeProvider($: EngineInterface, id: string) {
 async function forgetKey($: EngineInterface, id: string) {
   const { [id]: _, ...keys } = await storedKeys($)
   await $.store.set(STORE_KEYS, keys)
+  await setDraft($, 'key', '')
+  staleIds.delete(id)
   const p = (await syncProviders($)).find(x => x.id === id)
   if (p) await reloadProvider($, p)
 }
@@ -352,6 +382,12 @@ async function setOverride($: EngineInterface, key: string, patch: Override) {
 
 async function setVision($: EngineInterface, key: string, value: string) {
   await setOverride($, key, { image: value === 'yes' ? true : value === 'no' ? false : undefined })
+}
+
+/** The context window as typed: kept once it reads as a whole window, or cleared when emptied. */
+async function typeContextWindow($: EngineInterface, key: string, value: string) {
+  const n = parseTokens(value)
+  if (!value.trim() || (n !== undefined && n >= MIN_CONTEXT)) await setOverride($, key, { contextWindow: n })
 }
 
 async function setContextWindow($: EngineInterface, key: string, value: string) {
@@ -690,19 +726,15 @@ export const register: Register = (on, options) => {
 
     /**
      * A small label over its control, the control the form's full width, so every field
-     * lines up at any pane width; `aside` sits at the control's right (a field's own action).
+     * lines up at any pane width; `below` sits right under the control (a field's own action).
      */
-    const field = (label: string, control: RenderElement, aside?: RenderElement) => (
+    const field = (label: string, control: RenderElement, below?: RenderElement) => (
       <Box flexDirection="column">
         <Text size="caption" dimColor>
           {label}
         </Text>
-        <Box flexDirection="row" alignItems="center" columnGap={1}>
-          <Box flexGrow={1} flexShrink={1} minWidth={0}>
-            {control}
-          </Box>
-          {aside}
-        </Box>
+        {control}
+        {below}
       </Box>
     )
 
@@ -727,8 +759,8 @@ export const register: Register = (on, options) => {
                   key="form-name"
                   placeholder="e.g. DeepSeek"
                   value={d.name}
-                  onInput={value => void setDraft($, 'name', value)}
-                  onSubmit={value => void setDraft($, 'name', value)}
+                  onInput={value => void editField($, 'name', value)}
+                  onSubmit={value => void submitField($, 'name', value)}
                 />,
               )}
               {field(
@@ -737,22 +769,26 @@ export const register: Register = (on, options) => {
                   key="form-url"
                   placeholder="https://api.deepseek.com"
                   value={d.url}
-                  onInput={value => void setDraft($, 'url', value)}
-                  onSubmit={value => void setDraft($, 'url', value)}
+                  onInput={value => void editField($, 'url', value)}
+                  onSubmit={value => void submitField($, 'url', value)}
                 />,
               )}
               {field(
                 'API key',
                 <Input
                   key="form-key"
-                  placeholder={p?.keyHint ? `…${p.keyHint} (kept if empty)` : 'optional'}
+                  placeholder={p?.keyHint ? 'type to replace the saved key' : 'optional'}
                   value={d.key}
-                  submitLabel="save"
-                  onInput={value => void setDraft($, 'key', value)}
-                  onSubmit={value => void submitKey($, value)}
+                  onInput={value => void editField($, 'key', value)}
+                  onSubmit={value => void submitField($, 'key', value)}
                 />,
                 p?.keyHint ? (
-                  <Button key={`forget:${p.id}`} label="Forget" dimColor onPress={() => void forgetKey($, p.id)} />
+                  <Box flexDirection="row" alignItems="center" columnGap={1}>
+                    <Text size="caption" dimColor>
+                      Saved key …{p.keyHint}
+                    </Text>
+                    <Button key={`forget:${p.id}`} label="Forget" plain onPress={() => void forgetKey($, p.id)} />
+                  </Box>
                 ) : undefined,
               )}
             </Box>
@@ -767,16 +803,19 @@ export const register: Register = (on, options) => {
             </Box>
           ) : (
             <Box flexDirection="row" flexWrap="wrap" justifyContent="space-between" alignItems="center" columnGap={1} marginTop="xs">
-              <Box flexDirection="row" flexWrap="wrap" columnGap={1}>
-                {!isConfig && (
-                  <Button key="save-provider" label={p ? 'Save' : 'Add provider'} variant="primary" onPress={() => void saveDraft($)} />
-                )}
+              <Box flexDirection="row" flexWrap="wrap" alignItems="center" columnGap={1}>
+                {!p && <Button key="save-provider" label="Add provider" variant="primary" onPress={() => void saveDraft($)} />}
                 {p && (
                   <Button
                     key={`reload:${p.id}`}
                     label={all[p.id]?.isLoading ? 'Reloading…' : 'Reload'}
                     onPress={() => void reloadOne($, p.id)}
                   />
+                )}
+                {p && !isConfig && (
+                  <Text size="caption" dimColor>
+                    Saved as you type
+                  </Text>
                 )}
               </Box>
               {p && !isConfig && (
@@ -827,7 +866,7 @@ export const register: Register = (on, options) => {
               key="context"
               placeholder={`reported: ${reported.contextWindow ? kTokens(reported.contextWindow) : 'unknown'}`}
               value={override?.contextWindow ? kTokens(override.contextWindow) : ''}
-              submitLabel="save"
+              onInput={value => void typeContextWindow($, selKey, value)}
               onSubmit={value => void setContextWindow($, selKey, value)}
             />,
           )}
@@ -906,10 +945,10 @@ export const register: Register = (on, options) => {
   })
 }
 
-/** Enter in the key field: take the key and save the provider. */
-async function submitKey($: EngineInterface, value: string) {
-  await setDraft($, 'key', value)
-  await saveDraft($)
+/** Enter in a field: adds the provider of the add form; an existing one is already saved. */
+async function submitField($: EngineInterface, field: keyof Draft, value: string) {
+  await editField($, field, value)
+  if ((await read($, editing)) === NEW) await saveDraft($)
 }
 
 /** Reload one provider's models, then leave a model it no longer lists. */
