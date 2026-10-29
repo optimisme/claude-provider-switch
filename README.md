@@ -111,8 +111,8 @@ turn (the `turn.step` hook) itself instead of sending it to Anthropic:
    Code composed,
 2. translates them to the chat-completions format (tool uses → `tool_calls`,
    tool results → `tool` messages),
-3. `POST`s them to `<base>/chat/completions`, with `Authorization: Bearer <key>`
-   when the provider has a key,
+3. `POST`s them to `<base>/chat/completions` with `curl`, with
+   `Authorization: Bearer <key>` when the provider has a key,
 4. turns the reply back into text and tool calls that Claude Code runs as usual
    (with its normal permission prompts).
 
@@ -120,7 +120,10 @@ With Claude selected, requests pass through untouched.
 
 ## Limitations
 
-- Replies arrive whole, not streamed.
+- Replies arrive whole, not streamed. Chat requests go through `curl` (included
+  in macOS, Windows 10 and later, and most Linux installs), allowed 5 minutes;
+  where curl is missing they use Claude Code's own HTTP call, which gives up
+  after 30 seconds.
 - A provider's model is offered these tools only: Bash, Read, Write, Edit, Glob,
   Grep, WebFetch, WebSearch and Agent. The mod API does not expose built-in tool
   schemas, so they are written out in `hooks/schemas.ts`. MCP and other tools

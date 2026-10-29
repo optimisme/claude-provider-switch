@@ -88,7 +88,7 @@ const CAPABILITIES = {
   ],
 }
 
-type Request = { url: string; body?: string; auth?: string }
+type Request = { url: string; body?: string; auth?: string; via?: 'fetch' | 'curl' }
 type Answer = { status?: number; json?: unknown; text?: string }
 
 const reply = (content: string, promptTokens = 10) => ({
@@ -102,8 +102,10 @@ const reply = (content: string, promptTokens = 10) => ({
  */
 function world(
   on: On,
-  { routes, history = HISTORY, tools = ['Read'], sections = ['intro'], toasts, opened }: {
+  { routes, history = HISTORY, tools = ['Read'], sections = ['intro'], toasts, opened, hasCurl = true }: {
     routes: Record<string, Answer | ((r: Request) => Answer)>
+    /** False: curl cannot be started on this machine. */
+    hasCurl?: boolean
     history?: Message[]
     tools?: string[]
     /** System prompt section ids; `intro` reads `You are Claude Code.`. */
@@ -132,14 +134,23 @@ function world(
   }))
   on('tool.list', () => ({ value: tools.map(name => ({ name, description: `The ${name} tool`, mcp: false })) }))
   on('session.messages', () => ({ value: history as never }))
-  on('http.fetch', (_, e) => {
-    const request = { url: e.url, body: e.init?.body, auth: e.init?.headers?.authorization }
+  const answer = (request: Request) => {
     requests.push(request)
-    const route = routes[e.url]
+    const route = routes[request.url]
     const answer = typeof route === 'function' ? route(request) : (route ?? { status: 404, text: 'Not found' })
-    const status = answer.status ?? 200
-    const text = answer.text ?? JSON.stringify(answer.json)
+    return { status: answer.status ?? 200, text: answer.text ?? JSON.stringify(answer.json) }
+  }
+  on('http.fetch', (_, e) => {
+    const { status, text } = answer({ url: e.url, body: e.init?.body, auth: e.init?.headers?.authorization, via: 'fetch' })
     return { value: { status, ok: status < 300, headers: {}, text } }
+  })
+  // curl as the chat request runs it: headers in `--header`, the body on stdin, the status last.
+  on('process.run', (_, e) => {
+    if (!hasCurl) return { deny: 'spawn curl ENOENT' }
+    const header = (name: string) =>
+      e.argv.find((a, i) => e.argv[i - 1] === '--header' && a.startsWith(`${name}: `))?.slice(name.length + 2)
+    const { status, text } = answer({ url: e.argv.at(-1)!, body: e.init?.stdin, auth: header('authorization'), via: 'curl' })
+    return { value: { exitCode: 0, stdout: `${text}\n${status}`, stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
   })
   return requests
 }
@@ -219,7 +230,7 @@ test('picking a configured model sends the next step to it', { options: OPTIONS 
   expect((await ui.find({ type: 'Text', text: /chat models/ }))?.text).toBe(
     '2 chat models · https://proxy.test · key …test · plugin config',
   )
-  expect(requests[0]).toEqual({ url: 'https://proxy.test/v1/models', body: undefined, auth: 'Bearer ieti_sk_test' })
+  expect(requests[0]).toEqual({ url: 'https://proxy.test/v1/models', body: undefined, auth: 'Bearer ieti_sk_test', via: 'fetch' })
 
   // Picking the provider selects its first model; the model list then shows under it.
   await ui.press({ key: 'pick:config' })
@@ -238,6 +249,8 @@ test('picking a configured model sends the next step to it', { options: OPTIONS 
   const call = requests.find(r => r.url.endsWith('/chat/completions'))
   const sent = JSON.parse(call?.body ?? '{}')
   expect(call?.auth).toBe('Bearer ieti_sk_test')
+  // The chat request goes through curl, which is not held to $.http.fetch's 30 s.
+  expect(call?.via).toBe('curl')
   expect(sent.model).toBe('deepseek-chat')
   expect(sent.messages[0]).toEqual({ role: 'system', content: 'You are Claude Code.' })
   // Only tools with a known schema are offered.
@@ -743,4 +756,18 @@ test('a provider not in use offers its models, and picking one switches to it', 
   // Selected, the row shows the full model settings instead.
   expect(await ui.find({ key: 'model:deepseek' })).toBeUndefined()
   expect((await ui.find({ key: 'model' }))?.props.value).toBe('proxy:deepseek/deepseek-reasoner')
+})
+
+test('without curl the chat request falls back to $.http.fetch', { options: OPTIONS }, async ($, on) => {
+  const requests = world(on, {
+    routes: {
+      'https://proxy.test/v1/models': { json: { data: [{ id: 'qwen' }] } },
+      'https://proxy.test/v1/chat/completions': reply('Hi.'),
+    },
+    hasCurl: false,
+  })
+  await start($)
+  await $.command.run(provider('qwen'))
+  expect((await drain($.turn.step(step()))).result.answer).toBe('Hi.')
+  expect(requests.filter(r => r.url.endsWith('/chat/completions')).map(r => r.via)).toEqual(['fetch'])
 })

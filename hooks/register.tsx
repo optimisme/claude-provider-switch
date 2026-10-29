@@ -82,6 +82,11 @@ let warnedModel = ''
 const reasonings = new Map<string, string>()
 // The most tool calls whose reasoning is kept; older ones are dropped first.
 const REASONINGS_KEPT = 500
+// How long a chat request may take. `$.http.fetch` gives up after 30 s and takes no
+// timeout, so chat requests go through curl, which a slow model can take minutes with.
+const CHAT_TIMEOUT_S = 300
+// False once curl could not be started here; chat requests then use `$.http.fetch`.
+let hasCurl = true
 // Providers whose URL or key changed in their open form: their models reload when it closes.
 const staleIds = new Set<string>()
 // Below this, a context window being typed is taken as not finished yet (`12` on the way to `128k`).
@@ -536,6 +541,47 @@ function catalogText(list: ProviderView[], all: Record<string, Catalog>): string
     .join('\n')
 }
 
+/**
+ * POSTs a chat request with curl, allowed CHAT_TIMEOUT_S; the body goes on stdin, as a
+ * whole conversation outgrows a command line. Where curl cannot start (a minimal Linux,
+ * a Windows before 10), it falls back to `$.http.fetch` and its 30 s for the session.
+ */
+async function postChat($: EngineInterface, url: string, key: string, body: string) {
+  const headers = { 'content-type': 'application/json', ...authHeaders(key) }
+  if (hasCurl) {
+    const run = await $.process
+      .run(
+        [
+          'curl',
+          '--silent',
+          '--show-error',
+          '--max-time',
+          String(CHAT_TIMEOUT_S),
+          '--request',
+          'POST',
+          ...Object.entries(headers).flatMap(([name, value]) => ['--header', `${name}: ${value}`]),
+          '--data-binary',
+          '@-',
+          '--write-out',
+          '\n%{http_code}',
+          url,
+        ],
+        { stdin: body, timeoutMs: (CHAT_TIMEOUT_S + 10) * 1000 },
+      )
+      .catch(() => undefined)
+    if (run) {
+      // curl's own failures (28 timed out, 6 unknown host, 7 refused) are the request's.
+      if (run.exitCode !== 0) throw new Error(`curl: ${run.stderr.trim() || `exit code ${run.exitCode}`}`)
+      if (run.isStdoutTruncated) throw new Error('the reply was too large to read')
+      const cut = run.stdout.lastIndexOf('\n')
+      const status = Number(run.stdout.slice(cut + 1))
+      return { status, ok: status >= 200 && status < 300, text: run.stdout.slice(0, cut) }
+    }
+    hasCurl = false
+  }
+  return $.http.fetch(url, { method: 'POST', headers, body })
+}
+
 export const register: Register = (on, options) => {
   pluginOptions = options
 
@@ -729,12 +775,7 @@ export const register: Register = (on, options) => {
       return fail(why)
     }
 
-    const send = (body: string) =>
-      $.http.fetch(`${apiBase(provider.url)}/chat/completions`, {
-        method: 'POST',
-        headers: { 'content-type': 'application/json', ...authHeaders(provider.key) },
-        body,
-      })
+    const send = (body: string) => postChat($, `${apiBase(provider.url)}/chat/completions`, provider.key, body)
 
     let reply
     try {
