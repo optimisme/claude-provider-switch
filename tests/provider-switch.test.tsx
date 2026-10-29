@@ -101,10 +101,12 @@ const reply = (content: string, promptTokens = 10) => ({
  */
 function world(
   on: On,
-  { routes, history = HISTORY, tools = ['Read'], toasts, opened }: {
+  { routes, history = HISTORY, tools = ['Read'], sections = ['intro'], toasts, opened }: {
     routes: Record<string, Answer | ((r: Request) => Answer)>
     history?: Message[]
     tools?: string[]
+    /** System prompt section ids; `intro` reads `You are Claude Code.`. */
+    sections?: string[]
     toasts?: string[]
     opened?: unknown[]
   },
@@ -124,7 +126,9 @@ function world(
     return { value: { isPlaced: true } }
   })
   on('session.start', (_, e) => ({ cwd: e.cwd }))
-  on('prompt.compose', () => ({ sections: [{ id: 'intro', text: 'You are Claude Code.', scope: 'shared' }] }))
+  on('prompt.compose', () => ({
+    sections: sections.map(id => ({ id, text: id === 'intro' ? 'You are Claude Code.' : `The ${id} section.`, scope: 'shared' as const })),
+  }))
   on('tool.list', () => ({ value: tools.map(name => ({ name, description: `The ${name} tool`, mcp: false })) }))
   on('session.messages', () => ({ value: history as never }))
   on('http.fetch', (_, e) => {
@@ -579,41 +583,70 @@ test('a thinking model gets its reasoning back with the tool calls it made', { o
   )
 })
 
-test('context tools switched off for a provider are not sent, and the pane counts their tokens', { options: OPTIONS }, async ($, on) => {
+test('context items switched off for a provider are not sent, and the pane counts their tokens', { options: OPTIONS }, async ($, on) => {
   const requests = world(on, {
     routes: {
       'https://proxy.test/v1/models': { json: { data: [{ id: 'qwen' }] } },
       'https://proxy.test/v1/chat/completions': reply('ok'),
     },
     tools: ['Read', 'Bash', 'mcp__x__y'],
+    sections: ['intro', 'memory'],
   })
   await start($)
   await $.command.run(provider('qwen'))
   await $.prompt.compose({ model: 'claude-opus-5-5', promptModel: 'claude-opus-5-5', surfaces: ['desktop'], tools: ['Read'], outputStyle: null, traits: [] })
 
   const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  // Folded at first: the header shows the total alone.
+  expect(await ui.find({ key: 'tool:Bash' })).toBeUndefined()
+  expect((await ui.find({ type: 'Text', text: /per request$/ }))?.text).toMatch(/^~\d+ per request$/)
+  await ui.press({ key: 'context-toggle' })
+
   // Only tools with a known schema are listed, each on and with its cost.
   expect(await ui.find({ key: 'tool:mcp__x__y' })).toBeUndefined()
   expect((await ui.find({ key: 'tool:Bash' }))?.text).toMatch(/^☑ Bash · ~\d+$/)
-  const total = async () => (await ui.find({ type: 'Text', text: /^Tools ~/ }))?.text
-  expect(await total()).toMatch(/^Tools ~\d+ tokens \+ system prompt ~\d+ = ~\d+ per request$/)
-  const before = await total()
+  expect((await ui.find({ key: 'section:memory' }))?.text).toMatch(/^☑ memory · ~\d+$/)
+  const header = async () => (await ui.find({ type: 'Text', text: /per request$/ }))?.text
 
   await ui.press({ key: 'tool:Bash' })
+  await ui.press({ key: 'section:memory' })
   expect((await ui.find({ key: 'tool:Bash' }))?.text).toMatch(/^☐ Bash/)
-  expect(await total()).not.toBe(before)
+  expect(await header()).toMatch(/^~\d+ of ~\d+ per request$/)
   await ui.unmount()
 
+  await $.prompt.compose({ model: 'claude-opus-5-5', promptModel: 'claude-opus-5-5', surfaces: ['desktop'], tools: ['Read'], outputStyle: null, traits: [] })
   await drain($.turn.step(step()))
   const sent = JSON.parse(requests.find(r => r.url.endsWith('/chat/completions'))?.body ?? '{}')
   expect(sent.tools.map((t: { function: { name: string } }) => t.function.name)).toEqual(['Read'])
+  expect(sent.messages[0]).toEqual({ role: 'system', content: 'You are Claude Code.' })
 
-  // None sends no tools at all; the choice is kept for the next session.
+  // None sends no tools at all; All brings them back.
   const again = await $.ui.mount({ ...PANE, surface: 'desktop' })
   await again.press({ key: 'tools-none' })
-  expect((await again.find({ type: 'Text', text: /^Tools ~/ }))?.text).toMatch(/^Tools ~0 tokens/)
+  expect((await again.find({ type: 'Text', text: /^Tools · / }))?.text).toBe('Tools · ~0')
   await again.press({ key: 'tools-all' })
   expect((await again.find({ key: 'tool:Bash' }))?.text).toMatch(/^☑ Bash/)
+})
+
+test('Claude has its own context settings: an off tool is deferred, an off reminder is dropped', async ($, on) => {
+  world(on, { routes: {} })
+  on('tool.describe', (_, e) => ({ description: e.description }))
+  on('prompt.attachment', (_, e) => ({ text: e.text }))
+  await start($)
+  const described = await $.tool.describe({ tool: 'Bash', description: 'Runs a command.', provider: { plugin: 'engine', tier: 'core' } } as never)
+  expect(described.isDeferred).toBeUndefined()
+  await $.prompt.attachment({ type: 'skill_listing', text: 'Skills: a, b, c', origin: { kind: 'engine' } } as never)
+
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  await ui.press({ key: 'context-toggle' })
+  expect((await ui.find({ type: 'Text', text: /^▾ Context for / }))?.text).toBe('▾ Context for Claude')
+  await ui.press({ key: 'tool:Bash' })
+  await ui.press({ key: 'inject:skill_listing' })
+
+  expect((await $.tool.describe({ tool: 'Bash', description: 'Runs a command.', provider: { plugin: 'engine', tier: 'core' } } as never)).isDeferred).toBe(true)
+  expect((await $.prompt.attachment({ type: 'skill_listing', text: 'Skills: a, b, c', origin: { kind: 'engine' } } as never)).text).toBeNull()
+  // A mentioned file is the conversation itself: never offered, never dropped.
+  expect((await $.prompt.attachment({ type: 'file', text: 'contents', origin: { kind: 'engine' } } as never)).text).toBe('contents')
 })
 
 test('a provider not in use offers its models, and picking one switches to it', async ($, on) => {

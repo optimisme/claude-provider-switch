@@ -51,6 +51,21 @@ export type ContextUse = {
   inputTokens: number
 }
 
+/**
+ * One thing every request carries before the conversation, as the pane lists it:
+ * `tool:<name>`, `section:<id>` (system prompt), `inject:<kind>` (a reminder or
+ * hook context the engine adds), or `block:<name>` (a context block of the first message).
+ */
+export type ContextItem = { id: string; label: string; tokens: number }
+
+/** What the requests of this session were seen to carry, so the pane can offer it. */
+export type ContextSeen = {
+  /** Claude's own tool schemas in the prompt (not those behind ToolSearch). */
+  tools: ContextItem[]
+  sections: ContextItem[]
+  injected: ContextItem[]
+}
+
 /** The add-provider form as typed so far. */
 export type Draft = { name: string; url: string; key: string }
 
@@ -64,8 +79,11 @@ declare module 'claude-code' {
       /** Per `<providerId>/<model>`. */
       overrides: Record<string, Override>
       context: ContextUse | null
-      /** Per provider id: the tools the person switched off for it. */
-      disabledTools: Record<string, string[]>
+      /** Per provider id, or `claude`: the context items (ContextItem ids) switched off for it. */
+      contextOff: Record<string, string[]>
+      contextSeen: ContextSeen
+      /** Whether the pane's Context section is expanded. */
+      isContextOpen: boolean
       draft: Draft
       /** The provider whose form is open in the pane: its id, `+new` for the add form, or none. */
       editing: string | null

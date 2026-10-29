@@ -1,7 +1,7 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, PluginOptions, Register, RenderElement } from 'claude-code'
 
-import type { Catalog, ContextUse, Draft, ModelInfo, Override, ProviderView, Selection } from '../types'
+import type { Catalog, ContextItem, ContextSeen, ContextUse, Draft, ModelInfo, Override, ProviderView, Selection } from '../types'
 import {
   apiBase,
   authHeaders,
@@ -26,7 +26,9 @@ const providers = atom({ plugin: 'provider-switch', key: 'providers' } as const,
 const catalogs = atom({ plugin: 'provider-switch', key: 'catalogs' } as const, {} as Record<string, Catalog>)
 const overrides = atom({ plugin: 'provider-switch', key: 'overrides' } as const, {} as Record<string, Override>)
 const context = atom({ plugin: 'provider-switch', key: 'context' } as const, null as ContextUse | null)
-const disabledTools = atom({ plugin: 'provider-switch', key: 'disabledTools' } as const, {} as Record<string, string[]>)
+const contextOff = atom({ plugin: 'provider-switch', key: 'contextOff' } as const, {} as Record<string, string[]>)
+const contextSeen = atom({ plugin: 'provider-switch', key: 'contextSeen' } as const, { tools: [], sections: [], injected: [] } as ContextSeen)
+const isContextOpen = atom({ plugin: 'provider-switch', key: 'isContextOpen' } as const, false)
 const draft = atom({ plugin: 'provider-switch', key: 'draft' } as const, { name: '', url: '', key: '' } as Draft)
 const editing = atom({ plugin: 'provider-switch', key: 'editing' } as const, null as string | null)
 const removing = atom({ plugin: 'provider-switch', key: 'removing' } as const, null as string | null)
@@ -38,7 +40,10 @@ const STORE_KEYS = 'keys' // { [providerId]: key }
 const STORE_OVERRIDES = 'overrides' // { [providerId/model]: Override }
 const STORE_SELECTION = 'selection'
 const STORE_LAST_MODELS = 'lastModels' // { [providerId]: model }, what picking the provider again selects
-const STORE_DISABLED_TOOLS = 'disabledTools' // { [providerId]: tool names switched off }
+const STORE_CONTEXT_OFF = 'contextOff' // { [providerId | 'claude']: ContextItem ids switched off }
+const STORE_CONTEXT_OPEN = 'contextOpen'
+// Before the Context section: { [providerId]: tool names switched off }.
+const LEGACY_DISABLED_TOOLS = 'disabledTools'
 // Before named providers: one URL and key typed in the pane.
 const LEGACY_URL = 'proxyUrl'
 const LEGACY_KEY = 'apiKey'
@@ -49,6 +54,10 @@ const CONFIG_ID = 'config'
 // `editing` while the add form is open; no slug can spell it.
 const NEW = '+new'
 const EMPTY_DRAFT: Draft = { name: '', url: '', key: '' }
+
+// Injected kinds that are the conversation itself (a mentioned file, a queued prompt, a mode
+// the person chose), never offered to switch off.
+const KEPT_INJECTIONS = /^(file|edited_text_file|queued_command|plan_mode.*|auto_mode.*)$/
 
 // Share of a model's context window at which the mod warns, once per model.
 const CONTEXT_WARN = 0.8
@@ -81,10 +90,10 @@ function kTokens(n: number): string {
   return n >= 1000 ? `${Math.round(n / 1000)}k` : String(n)
 }
 
-/** `My DeepSeek` → `my-deepseek`; never `config`, which the plugin's config holds. */
+/** `My DeepSeek` → `my-deepseek`; never `config` (the plugin's config) or `claude` (Claude's context settings). */
 function slug(name: string): string {
   const base = name.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '') || 'provider'
-  return base === CONFIG_ID ? `${base}-2` : base
+  return base === CONFIG_ID || base === CLAUDE ? `${base}-2` : base
 }
 
 /** `<providerId>/<model>`: what overrides and context use are keyed by. */
@@ -122,7 +131,7 @@ function describe(info: ModelInfo): string {
  */
 async function offeredTools($: EngineInterface, off: readonly string[] = []): Promise<OpenAiTool[]> {
   return (await $.tool.list())
-    .filter(t => KNOWN_SCHEMAS[t.name] && !off.includes(t.name))
+    .filter(t => KNOWN_SCHEMAS[t.name] && !off.includes(`tool:${t.name}`))
     .map(t => ({
       type: 'function',
       function: { name: t.name, description: t.description, parameters: KNOWN_SCHEMAS[t.name]! },
@@ -134,15 +143,39 @@ function toolTokens(tool: OpenAiTool): number {
   return estimateTokens(JSON.stringify(tool))
 }
 
-/** Switch tools on or off for a provider: `names` flip to `isOff`. */
-async function setToolsOff($: EngineInterface, providerId: string, names: readonly string[], isOff: boolean) {
-  const all = ((await $.store.get(STORE_DISABLED_TOOLS)) as Record<string, string[]> | undefined) ?? {}
-  const kept = (all[providerId] ?? []).filter(n => !names.includes(n))
-  const off = isOff ? [...kept, ...names] : kept
-  const { [providerId]: _, ...rest } = all
-  const next = off.length ? { ...rest, [providerId]: off } : rest
-  await $.store.set(STORE_DISABLED_TOOLS, next)
-  await update($, disabledTools, () => next)
+/** Whose context settings apply now: the selected provider's id, or `claude`. */
+function targetOf(sel: Selection): string {
+  return sel.provider === 'proxy' ? sel.providerId : CLAUDE
+}
+
+async function offNow($: EngineInterface): Promise<readonly string[]> {
+  return (await read($, contextOff))[targetOf(await read($, selection))] ?? []
+}
+
+/** Switch context items on or off for `target`: `ids` flip to `isOff`, from the next request. */
+async function setContextOff($: EngineInterface, target: string, ids: readonly string[], isOff: boolean) {
+  const all = ((await $.store.get(STORE_CONTEXT_OFF)) as Record<string, string[]> | undefined) ?? {}
+  const kept = (all[target] ?? []).filter(n => !ids.includes(n))
+  const off = isOff ? [...kept, ...ids] : kept
+  const { [target]: _, ...rest } = all
+  const next = off.length ? { ...rest, [target]: off } : rest
+  await $.store.set(STORE_CONTEXT_OFF, next)
+  await update($, contextOff, () => next)
+  // The engine keeps these answers until asked again; system prompt sections are asked every request.
+  if (ids.some(id => id.startsWith('inject:'))) $.ui.invalidate('prompt.attachment')
+  if (ids.some(id => id.startsWith('block:'))) $.ui.invalidate('prompt.context')
+  if (target === CLAUDE && ids.some(id => id.startsWith('tool:'))) $.ui.invalidate('tool.describe')
+}
+
+/** Record one item a request carried, keeping the pane's lists in step without needless redraws. */
+async function noteSeen($: EngineInterface, group: 'tools' | 'injected', item: ContextItem) {
+  const seen = await read($, contextSeen)
+  const before = seen[group].find(i => i.id === item.id)
+  if (before && before.tokens === item.tokens && before.label === item.label) return
+  await update($, contextSeen, all => ({
+    ...all,
+    [group]: before ? all[group].map(i => (i.id === item.id ? item : i)) : [...all[group], item],
+  }))
 }
 
 async function storedProviders($: EngineInterface): Promise<StoredProvider[]> {
@@ -217,6 +250,9 @@ async function choose($: EngineInterface, value: string) {
   const next = parseChoice(value)
   await update($, selection, () => next)
   await $.store.set(STORE_SELECTION, next)
+  // Each provider has its own context settings: the engine asks again for what it injects.
+  $.ui.invalidate('prompt.attachment')
+  $.ui.invalidate('prompt.context')
   if (next.provider === 'claude') return $.ui.toast('Model requests now go to Claude')
   const last = ((await $.store.get(STORE_LAST_MODELS)) as Record<string, string> | undefined) ?? {}
   await $.store.set(STORE_LAST_MODELS, { ...last, [next.providerId]: next.model })
@@ -471,8 +507,18 @@ export const register: Register = (on, options) => {
     }
     const stored = ((await $.store.get(STORE_OVERRIDES)) as Record<string, Override> | undefined) ?? {}
     await update($, overrides, () => stored)
-    const off = ((await $.store.get(STORE_DISABLED_TOOLS)) as Record<string, string[]> | undefined) ?? {}
-    await update($, disabledTools, () => off)
+    const legacyTools = (await $.store.get(LEGACY_DISABLED_TOOLS)) as Record<string, string[]> | undefined
+    if (legacyTools) {
+      const migrated = Object.fromEntries(Object.entries(legacyTools).map(([id, names]) => [id, names.map(n => `tool:${n}`)]))
+      await $.store.set(STORE_CONTEXT_OFF, { ...migrated, ...((await $.store.get(STORE_CONTEXT_OFF)) as object | undefined) })
+      await $.store.delete(LEGACY_DISABLED_TOOLS)
+    }
+    const off = ((await $.store.get(STORE_CONTEXT_OFF)) as Record<string, string[]> | undefined) ?? {}
+    await update($, contextOff, () => off)
+    const isOpen = ((await $.store.get(STORE_CONTEXT_OPEN)) as boolean | undefined) ?? false
+    await update($, isContextOpen, () => isOpen)
+    // A resumed thread sends the tool placement it recorded: ask again so Claude's switched-off tools stay deferred.
+    if (off[CLAUDE]?.length) $.ui.invalidate('tool.describe')
     await syncProviders($)
     // The backend now shows as a button above the prompt; clear the line an older version set.
     $.ui.status(undefined)
@@ -513,11 +559,49 @@ export const register: Register = (on, options) => {
     return { text: `Model requests now go to ${sel.provider === 'proxy' ? sel.model : arg} via ${name}.` }
   })
 
+  // The system prompt, less the sections switched off for whoever answers now.
   on('prompt.compose', async ($, e, next) => {
     const composed = await next(e)
-    systemPrompt = composed.sections.map(s => s.text).join('\n\n')
+    const sections = composed.sections.map(s => ({ id: `section:${s.id}`, label: s.id, tokens: estimateTokens(s.text) }))
+    const seen = await read($, contextSeen)
+    if (JSON.stringify(seen.sections) !== JSON.stringify(sections)) await update($, contextSeen, all => ({ ...all, sections }))
 
-    return composed
+    const off = await offNow($)
+    const kept = composed.sections.filter(s => !off.includes(`section:${s.id}`))
+    systemPrompt = kept.map(s => s.text).join('\n\n')
+    return { sections: kept }
+  })
+
+  // Reminders, listings and hook context the engine adds to the conversation on its own.
+  on('prompt.attachment', async ($, e, next) => {
+    const answer = await next(e)
+    if (answer.text === null || KEPT_INJECTIONS.test(e.type)) return answer
+    const kind = e.origin.kind === 'engine' ? e.type : `${e.origin.kind}:${e.origin.event}`
+    const label = e.origin.kind === 'hook' ? `${e.origin.event} hook` : e.origin.kind === 'plugin' ? `plugin (${e.origin.event})` : e.type
+    const id = `inject:${kind}`
+    if (e.agentId === undefined) await noteSeen($, 'injected', { id, label, tokens: estimateTokens(answer.text) })
+    return (await offNow($)).includes(id) ? { text: null } : answer
+  })
+
+  // The blocks the first user message carries: CLAUDE.md, the user's email, the date, ...
+  on('prompt.context', async ($, e, next) => {
+    const answer = await next(e)
+    for (const b of answer.blocks) {
+      await noteSeen($, 'injected', { id: `block:${b.name}`, label: b.name, tokens: estimateTokens(b.text) })
+    }
+    const off = await offNow($)
+    return { ...answer, blocks: answer.blocks.filter(b => !off.includes(`block:${b.name}`)) }
+  })
+
+  // Claude's tool schemas: one switched off waits behind ToolSearch, loaded only when asked for.
+  on('tool.describe', async ($, e, next) => {
+    const answer = await next(e)
+    if (e.isDeferred || answer.isDeferred === true) return answer
+    const schema = KNOWN_SCHEMAS[e.tool]
+    const tokens = estimateTokens(answer.description + (schema ? JSON.stringify(schema) : ''))
+    await noteSeen($, 'tools', { id: `tool:${e.tool}`, label: e.tool, tokens })
+    const off = (await read($, contextOff))[CLAUDE] ?? []
+    return off.includes(`tool:${e.tool}`) ? { ...answer, isDeferred: true } : answer
   })
 
   on('turn.step', async function* ($, e, next) {
@@ -562,7 +646,7 @@ export const register: Register = (on, options) => {
     const key = modelKey(provider.id, sel.model)
     const info = effectiveInfo((await read($, catalogs))[provider.id], (await read($, overrides))[key], sel.model)
     // Only a model its provider says lacks tools gets none; unknown means try.
-    const tools = info.tools === false ? [] : await offeredTools($, (await read($, disabledTools))[provider.id])
+    const tools = info.tools === false ? [] : await offeredTools($, (await read($, contextOff))[provider.id])
 
     const request = (fillReasoning: boolean) =>
       JSON.stringify({
@@ -691,8 +775,11 @@ export const register: Register = (on, options) => {
     const d = await read($, draft)
     const open = await read($, editing)
     const confirming = await read($, removing)
-    const off = sel.provider === 'proxy' ? ((await read($, disabledTools))[sel.providerId] ?? []) : []
-    const known = sel.provider === 'proxy' ? await offeredTools($) : []
+    const target = targetOf(sel)
+    const off = (await read($, contextOff))[target] ?? []
+    const seen = await read($, contextSeen)
+    const isOpenContext = await read($, isContextOpen)
+    const proxyTools = sel.provider === 'proxy' ? await offeredTools($) : []
 
     const selKey = sel.provider === 'proxy' ? modelKey(sel.providerId, sel.model) : ''
     const selName = sel.provider === 'proxy' ? (list.find(p => p.id === sel.providerId)?.name ?? sel.providerId) : ''
@@ -721,52 +808,99 @@ export const register: Register = (on, options) => {
     )
 
     /**
-     * Context tools: the selected provider's tools, each switched on or off with what it
-     * costs, and the total its model is sent before the conversation.
+     * Context: what every request to the selected provider carries before the conversation
+     * (tools, system prompt sections, injected reminders and context blocks), each switched
+     * on or off with what it costs. Folded by default; its header shows the total.
      */
-    const toolSettings = () => {
-      if (sel.provider !== 'proxy' || info.tools === false) return null
-      const id = sel.providerId
-      const names = known.map(t => t.function.name)
-      const toolsTotal = known.filter(t => !off.includes(t.function.name)).reduce((n, t) => n + toolTokens(t), 0)
-      const systemTotal = systemPrompt ? estimateTokens(systemPrompt) : 0
+    const contextSection = () => {
+      const targetName = sel.provider === 'proxy' ? selName : 'Claude'
+      const tools: ContextItem[] =
+        sel.provider === 'proxy'
+          ? info.tools === false
+            ? []
+            : proxyTools.map(t => ({ id: `tool:${t.function.name}`, label: t.function.name, tokens: toolTokens(t) }))
+          : seen.tools
+      const groups = [
+        {
+          key: 'tools',
+          title: 'Tools',
+          items: tools,
+          empty:
+            sel.provider === 'proxy'
+              ? info.tools === false
+                ? 'This model gets no tools.'
+                : 'No tool in this session has a schema the mod knows.'
+              : 'Listed once Claude Code has sent its tools.',
+        },
+        { key: 'sections', title: 'System prompt', items: seen.sections, empty: 'Listed after the first request.' },
+        { key: 'injected', title: 'Injected context', items: seen.injected, empty: 'Listed after the first request.' },
+      ]
+      const sum = (items: readonly ContextItem[]) => items.filter(i => !off.includes(i.id)).reduce((n, i) => n + i.tokens, 0)
+      const total = groups.reduce((n, g) => n + sum(g.items), 0)
+      const everything = groups.reduce((n, g) => n + g.items.reduce((m, i) => m + i.tokens, 0), 0)
+      const toggle = () => {
+        void update($, isContextOpen, v => !v)
+        void $.store.set(STORE_CONTEXT_OPEN, !isOpenContext)
+      }
       return (
-        <Box key="context-tools" flexDirection="column" rowGap="xs" marginTop="xs">
+        <Box key="context" flexDirection="column" rowGap="xs" borderStyle="round" borderDimColor paddingX={1}>
           <Box flexDirection="row" flexWrap="wrap" justifyContent="space-between" alignItems="center" columnGap={1}>
+            <Button key="context-toggle" plain onPress={toggle}>
+              <Text bold>{`${isOpenContext ? '▾' : '▸'} Context for ${targetName}`}</Text>
+            </Button>
             <Text size="caption" dimColor>
-              Context tools
+              {total === everything ? `~${kTokens(total)} per request` : `~${kTokens(total)} of ~${kTokens(everything)} per request`}
             </Text>
-            {known.length > 0 && (
-              <Box flexDirection="row" flexWrap="wrap" columnGap={1}>
-                <Button key="tools-all" label="All" plain dimColor onPress={() => void setToolsOff($, id, names, false)} />
-                <Button key="tools-none" label="None" plain dimColor onPress={() => void setToolsOff($, id, names, true)} />
-              </Box>
-            )}
           </Box>
-          {known.length ? (
-            <Box flexDirection="row" flexWrap="wrap" columnGap={1} rowGap="xs">
-              {known.map(t => {
-                const name = t.function.name
-                const isOn = !off.includes(name)
+          {isOpenContext && (
+            <Box flexDirection="column" rowGap="sm">
+              <Text size="caption" dimColor>
+                {sel.provider === 'proxy'
+                  ? `Sent to ${targetName} with every request, before the conversation. Off items are left out.`
+                  : 'Sent to Claude with every request, before the conversation. Off tools wait behind ToolSearch; other off items are left out.'}
+              </Text>
+              {groups.map(g => {
+                const ids = g.items.map(i => i.id)
                 return (
-                  <Button
-                    key={`tool:${name}`}
-                    label={`${isOn ? '☑' : '☐'} ${name} · ~${kTokens(toolTokens(t))}`}
-                    dimColor={!isOn}
-                    onPress={() => void setToolsOff($, id, [name], isOn)}
-                  />
+                  <Box key={`group:${g.key}`} flexDirection="column" rowGap="xs">
+                    <Box flexDirection="row" flexWrap="wrap" justifyContent="space-between" alignItems="center" columnGap={1}>
+                      <Text size="caption" dimColor>
+                        {`${g.title} · ~${kTokens(sum(g.items))}`}
+                      </Text>
+                      {g.items.length > 0 && (
+                        <Box flexDirection="row" flexWrap="wrap" columnGap={1}>
+                          <Button key={`${g.key}-all`} label="All" plain dimColor onPress={() => void setContextOff($, target, ids, false)} />
+                          <Button key={`${g.key}-none`} label="None" plain dimColor onPress={() => void setContextOff($, target, ids, true)} />
+                        </Box>
+                      )}
+                    </Box>
+                    {g.items.length ? (
+                      <Box flexDirection="row" flexWrap="wrap" columnGap={1} rowGap="xs">
+                        {g.items.map(item => {
+                          const isOn = !off.includes(item.id)
+                          return (
+                            <Button
+                              key={item.id}
+                              label={`${isOn ? '☑' : '☐'} ${item.label} · ~${kTokens(item.tokens)}`}
+                              dimColor={!isOn}
+                              onPress={() => void setContextOff($, target, [item.id], isOn)}
+                            />
+                          )
+                        })}
+                      </Box>
+                    ) : (
+                      <Text size="caption" dimColor>
+                        {g.empty}
+                      </Text>
+                    )}
+                  </Box>
                 )
               })}
+              <Text size="caption" dimColor>
+                {`~${kTokens(total)} tokens per request, plus the conversation itself`}
+              </Text>
             </Box>
-          ) : (
-            <Text size="caption" dimColor>
-              No tool in this session has a schema the mod knows.
-            </Text>
           )}
-          <Text size="caption" dimColor>
-            {`Tools ~${kTokens(toolsTotal)} tokens`}
-            {systemTotal ? ` + system prompt ~${kTokens(systemTotal)} = ~${kTokens(toolsTotal + systemTotal)} per request` : ' per request'}
-          </Text>
         </Box>
       )
     }
@@ -803,8 +937,8 @@ export const register: Register = (on, options) => {
                 onPress={() => void choose($, `${PROXY_PREFIX}${sel.providerId}/${model}`)}
               />
             ))}
-          {toolSettings()}
           <Button key="reload" label={isLoading ? 'Reloading…' : 'Reload all'} onPress={() => void reloadAll($)} />
+          {contextSection()}
         </Box>
       )
     }
@@ -990,7 +1124,6 @@ export const register: Register = (on, options) => {
               onSubmit={value => void setContextWindow($, selKey, value)}
             />,
           )}
-          {toolSettings()}
         </Box>
       )
     }
@@ -1061,6 +1194,7 @@ export const register: Register = (on, options) => {
           ),
         )}
         {!list.length && open !== NEW && <Text dimColor>No providers yet: press + Add.</Text>}
+        {contextSection()}
       </Box>
     )
   })

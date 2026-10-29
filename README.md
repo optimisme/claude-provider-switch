@@ -29,11 +29,20 @@ DeepSeek, OpenAI, OpenRouter, Groq, Mistral, a local Ollama or vLLM, and so on.
   - After each answer the pane and the button show how full the context is;
     at 80% a toast suggests `/compact` or switching to Claude. A conversation
     already larger than the window is stopped before it is sent.
-- **Context tools**: under the selected provider, one toggle per tool its
-  models can be offered, each with about how many prompt tokens its schema
-  costs, plus **All** and **None**. The total below adds the system prompt, so
-  you see what every request spends before the conversation. The choice is kept
-  per provider, across sessions.
+- **Context**: a folded section at the bottom of the pane, for whichever
+  provider is selected, Claude included. Its header shows about how many
+  tokens every request carries before the conversation. Unfolded, it lists
+  each item with its cost and a toggle, plus **All** and **None** per group:
+  - **Tools**: for a provider, the tools its model is offered; for Claude, the
+    tool schemas in the prompt (one switched off waits behind ToolSearch).
+  - **System prompt**: each section of Claude Code's system prompt.
+  - **Injected context**: reminders and listings the engine adds (skills,
+    deferred tools, ...), hooks' context (`SessionStart` and others) and the
+    first message's context blocks (`claudeMd`, `userEmail`, ...). Mentioned
+    files and queued prompts are never offered.
+
+  The choice is kept per provider, across sessions. System prompt sections and
+  injected context are listed once a request has carried them.
 - **Button above the prompt**: `⇄ Claude` or `⇄ <model> (<provider>) · <n>% ctx`;
   press it to open the pane.
 - **`/provider`**: opens the pane. `/provider <model>` selects the first
@@ -106,7 +115,7 @@ With Claude selected, requests pass through untouched.
 - A provider's model is offered these tools only: Bash, Read, Write, Edit, Glob,
   Grep, WebFetch, WebSearch and Agent. The mod API does not expose built-in tool
   schemas, so they are written out in `hooks/schemas.ts`. MCP and other tools
-  are not offered, and any of these can be switched off under **Context tools**.
+  are not offered, and any of these can be switched off under **Context**.
 - Thinking blocks, documents and prompt caching are not forwarded. Reasoning
   models that expect their reasoning sent back during a tool loop may fail.
 - Models only reachable through OpenAI's Responses API, and Azure OpenAI's URL
